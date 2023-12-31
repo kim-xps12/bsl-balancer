@@ -1,10 +1,10 @@
 # BSL-Balancer
 
 **front**
-![front](./front.png)
+![front](./docs/front.jpg)
 
 **back**
-![back](./back.png)
+![back](./docs/back.jpg)
 
 
 ## BOM
