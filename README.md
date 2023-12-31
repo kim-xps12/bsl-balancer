@@ -1,10 +1,10 @@
 # BSL-Balancer
 
 **front**
-![front](./docs/front.png)
+![front](./front.png)
 
 **back**
-![back](./docs/back.png)
+![back](./back.png)
 
 
 ## BOM
@@ -17,7 +17,7 @@
 | Servo IF Board | B-SKY Lab Original Board | 1 pc. | [GitHub](https://github.com/kim-xps12/m5stack_interface_board_feetech_sts "https://github.com/kim-xps12/m5stack_interface_board_feetech_sts") |
 | Cable | M5STACK-CABLE-10 | 1 pc. | [switch-science](https://www.switch-science.com/products/5213 "https://www.switch-science.com/products/5213"), sengoku<br> |
 | Tire Unit | TAMIYA Narrow Tire | 1 set | Amazon |
-| Battery | AAA | 3 pcs. | \-  |
+| Battery | AAA Type | 3 pcs. | \-  |
 | Battery Box | SBH-441AS | 1 pc. | akitsuki |
 | Body (3D-Printed Parts) | B-SKY Lab Original Board<br> | 1 set | this repository |
 | M3 Bolt |   | 4 pcs. |    |
