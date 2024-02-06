@@ -155,7 +155,8 @@ void calcPID(){
     
   // Calclate Motor Output
   int rpm_motor = Kp * P + Ki * I + Kd * D;
-  rpm_motor = constrain(rpm_motor, -300, 300);
+  //rpm_motor = constrain(rpm_motor, -300, 300);
+  rpm_motor = constrain(rpm_motor, -120, 120); //min:-120rpm ~ max:120rpm, as XC330
   driveTire(rpm_motor);
   //DEBUG_SERIAL.println(pitch_kalman);
 
