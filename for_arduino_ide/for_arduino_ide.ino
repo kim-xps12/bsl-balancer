@@ -1,10 +1,9 @@
-#include <Dynamixel2Arduino.h>
-#include <Kalman.h>
 #include <M5Unified.h>
-#include <WebServer.h>
+#include <Kalman.h>
 #include <Preferences.h>
+#include <Dynamixel2Arduino.h>
 
-#define DXL_SERIAL   Serial1
+HardwareSerial& DXL_SERIAL = Serial1;
 #define DEBUG_SERIAL Serial
 #define ENABLE_DEBUG_PRINT
 
@@ -38,7 +37,8 @@ unsigned long elapsedTime = 0;
 const uint8_t DXL_ID_L = 0;
 const uint8_t DXL_ID_R = 1;
 const float DXL_PROTOCOL_VERSION = 2.0;
-Dynamixel2Arduino dxl(DXL_SERIAL);
+
+Dynamixel2Arduino dxl;//(DXL_SERIAL);
 
 float getPitch(){
   M5.Imu.getAccelData(&accX, &accY, &accZ);
@@ -178,6 +178,9 @@ void drawButton(const char* label, int x, int y, float value) {
 }
 
 void setup(){
+
+  DXL_SERIAL.begin(2000000, SERIAL_8N1, 32, 33);
+  dxl = Dynamixel2Arduino(DXL_SERIAL);
 
   // M5 Settings
   M5.begin();
