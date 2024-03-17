@@ -38,6 +38,7 @@ By constructing a 3D printed body with M5Stack Core2 and DYNAMIXEL XL330 as the 
 - ~~Arduino IDE on Windows 11 (please apply M5Stack setting)~~
 
 **NOTE**
+
 このリポジトリではArduino IDEのサポートのサポートを終了しました．
 `for_arduino_ide`に以前までのコードを保存しているので，サンプルとしての利用は可能です．
 Arduino IDEで開発される場合は，これをベースにPIO向けのコードの内容を手動で反映させることでお使いいただけます．
