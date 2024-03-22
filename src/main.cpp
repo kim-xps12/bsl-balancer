@@ -1,10 +1,11 @@
-#include <Dynamixel2Arduino.h>
-#include <Kalman.h>
-#include <M5Unified.h>
-#include <WebServer.h>
-#include <Preferences.h>
+#include <Arduino.h>
 
-#define DXL_SERIAL   Serial1
+#include <M5Unified.h>
+#include <Kalman.h>
+#include <Preferences.h>
+#include <Dynamixel2Arduino.h>
+
+HardwareSerial& DXL_SERIAL = Serial1;
 #define DEBUG_SERIAL Serial
 #define ENABLE_DEBUG_PRINT
 
@@ -38,7 +39,8 @@ unsigned long elapsedTime = 0;
 const uint8_t DXL_ID_L = 0;
 const uint8_t DXL_ID_R = 1;
 const float DXL_PROTOCOL_VERSION = 2.0;
-Dynamixel2Arduino dxl(DXL_SERIAL);
+
+Dynamixel2Arduino dxl;//(DXL_SERIAL);
 
 float getPitch(){
   M5.Imu.getAccelData(&accX, &accY, &accZ);
@@ -68,55 +70,6 @@ void driveTire(int rpm) {
   #endif
 }
 
-
-void controlLoopTask(void *pvParameters) {
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-
-    while(true) {
-      calcPID();
-      vTaskDelayUntil(&xLastWakeTime, xPeriodMs);
-    }
-}
-
-
-void uiLoopTask(void *pvParameters){
-  
-  TickType_t xLastWakeTime = xTaskGetTickCount();  
-  while(true){
-    M5.update();
-
-    bool isReleased = true;
-    if (M5.Touch.getCount() > 0 ) {
-      isReleased = false;
-      auto pos = M5.Touch.getDetail();
-
-      if(pos.wasPressed()){
-        // 各ボタンのタッチ確認
-        if (pos.y >= 30 && pos.y < 60) { // Target
-          if (pos.x >= 15 && pos.x < 120) pitch_target-=0.2;
-          else if (pos.x >= 220 && pos.x < 270) pitch_target+=0.2;
-          drawButton("Ref", 20, 30, pitch_target);
-        }
-        else if (pos.y >= 70 && pos.y < 100) {
-          if (pos.x >= 15 && pos.x < 120) Kp-=0.2;
-          else if (pos.x >= 220 && pos.x < 270) Kp+=0.2;
-          drawButton("Kp", 20, 70, Kp);
-        }
-        else if (pos.y >= 110 && pos.y < 140) { // Ki
-          if (pos.x >= 15 && pos.x < 120) Ki-=0.2;
-          else if (pos.x >= 220 && pos.x < 270) Ki+=0.2;
-          drawButton("Ki", 20, 110, Ki);
-        }
-        else if (pos.y >= 150 && pos.y < 180) { // Kd
-          if (pos.x >= 15 && pos.x < 120) Kd-=0.2;
-          else if (pos.x >= 220 && pos.x < 270) Kd+=0.2;
-          drawButton("Kd", 20, 150, Kd);
-        }
-      }
-    }
-    vTaskDelayUntil(&xLastWakeTime, xPeriodMs*5);
-  }
-}
 
 void calcPID(){
 
@@ -177,7 +130,61 @@ void drawButton(const char* label, int x, int y, float value) {
   M5.Display.println(value, 1);
 }
 
+
+void controlLoopTask(void *pvParameters) {
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+
+    while(true) {
+      calcPID();
+      vTaskDelayUntil(&xLastWakeTime, xPeriodMs);
+    }
+}
+
+
+void uiLoopTask(void *pvParameters){
+  
+  TickType_t xLastWakeTime = xTaskGetTickCount();  
+  while(true){
+    M5.update();
+
+    bool isReleased = true;
+    if (M5.Touch.getCount() > 0 ) {
+      isReleased = false;
+      auto pos = M5.Touch.getDetail();
+
+      if(pos.wasPressed()){
+        // 各ボタンのタッチ確認
+        if (pos.y >= 30 && pos.y < 60) { // Target
+          if (pos.x >= 15 && pos.x < 120) pitch_target-=0.2;
+          else if (pos.x >= 220 && pos.x < 270) pitch_target+=0.2;
+          drawButton("Ref", 20, 30, pitch_target);
+        }
+        else if (pos.y >= 70 && pos.y < 100) {
+          if (pos.x >= 15 && pos.x < 120) Kp-=0.2;
+          else if (pos.x >= 220 && pos.x < 270) Kp+=0.2;
+          drawButton("Kp", 20, 70, Kp);
+        }
+        else if (pos.y >= 110 && pos.y < 140) { // Ki
+          if (pos.x >= 15 && pos.x < 120) Ki-=0.2;
+          else if (pos.x >= 220 && pos.x < 270) Ki+=0.2;
+          drawButton("Ki", 20, 110, Ki);
+        }
+        else if (pos.y >= 150 && pos.y < 180) { // Kd
+          if (pos.x >= 15 && pos.x < 120) Kd-=0.2;
+          else if (pos.x >= 220 && pos.x < 270) Kd+=0.2;
+          drawButton("Kd", 20, 150, Kd);
+        }
+      }
+    }
+    vTaskDelayUntil(&xLastWakeTime, xPeriodMs*5);
+  }
+}
+
+
 void setup(){
+
+  DXL_SERIAL.begin(2000000, SERIAL_8N1, 32, 33);
+  dxl = Dynamixel2Arduino(DXL_SERIAL);
 
   // M5 Settings
   M5.begin();
