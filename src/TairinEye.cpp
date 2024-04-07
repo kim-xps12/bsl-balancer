@@ -8,6 +8,8 @@
 
 namespace m5avatar {
 
+bool en_draw_flower = false;  // If drawn only once every two times, the lines will be doubled.
+
 tairinEye::tairinEye(uint16_t x, uint16_t y, uint16_t r, bool isLeft) : tairinEye(r, isLeft) {}
 
 tairinEye::tairinEye(uint16_t r, bool isLeft) : r{r}, isLeft{isLeft} {}
@@ -23,36 +25,35 @@ void tairinEye::draw(M5Canvas *spi, BoundingRect rect, DrawContext *ctx) {
   uint16_t primaryColor = ctx->getColorDepth() == 1 ? 1 : ctx->getColorPalette()->get(COLOR_PRIMARY);
   uint16_t backgroundColor = ctx->getColorDepth() == 1 ? 0 : ctx->getColorPalette()->get(COLOR_BACKGROUND);
 
+  // Draw eyes
   if (openRatio > 0) {
-    spi->fillCircle(x + offsetX, y + offsetY, r, primaryColor);
-    if (exp == Expression::Angry || exp == Expression::Sad) {
-      int x0, y0, x1, y1, x2, y2;
-      x0 = x + offsetX - r;
-      y0 = y + offsetY - r;
-      x1 = x0 + r * 2;
-      y1 = y0;
-      x2 = !isLeft != !(exp == Expression::Sad) ? x0 : x1;
-      y2 = y0 + r;
-      spi->fillTriangle(x0, y0, x1, y1, x2, y2, backgroundColor);
-    }
-    if (exp == Expression::Happy || exp == Expression::Sleepy) {
-      int x0, y0, w, h;
-      x0 = x + offsetX - r;
-      y0 = y + offsetY - r;
-      w = r * 2 + 4;
-      h = r + 2;
-      if (exp == Expression::Happy) {
-        y0 += r;
-        spi->fillCircle(x + offsetX, y + offsetY, r / 1.5, backgroundColor);
-      }
-      spi->fillRect(x0, y0, w, h, backgroundColor);
-    }
+    spi->fillCircle(x + offsetX, y + offsetY, r, primaryColor);   // opened
   } else {
     int x1 = x - r + offsetX;
     int y1 = y - 2 + offsetY;
     int w = r * 2;
     int h = 4;
-    spi->fillRect(x1, y1, w, h, primaryColor);
+    spi->fillRect(x1, y1, w, h, primaryColor);    // closed
   }
+
+  // Draw flower
+  if(en_draw_flower){
+    for (double theta=0; theta<=2*PI; theta += 0.01) {
+      double n = 5; // The number of petals is twice n.
+      double a = 30;
+      double b = 6;
+      double c = 1;
+      double r = abs(a*sin(n*theta) + b*sin(3*n*theta) + c*sin(5*n*theta));
+
+      // Convert to Cartesian coordinate system
+      double x_bias = 275;   //275 is value for core2, x_bias is static
+      double y_bias = y-55;  //-55 is value for core2, y_bias is dynamic (for animation)
+      double x_flower = r * cos(theta) + x_bias;
+      double y_flower = r * sin(theta) + y_bias;
+      spi->drawPixel(x_flower, y_flower, primaryColor);
+    }
+  }
+  en_draw_flower = !en_draw_flower;
+
 }
 }  // namespace m5avatar
