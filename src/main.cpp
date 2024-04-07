@@ -1,13 +1,34 @@
 #include <Arduino.h>
 
 #include <M5Unified.h>
+#include <Avatar.h>
+
+#include "TairinEye.h"
+#include "TairinMouth.h"
+
 #include <Kalman.h>
 #include <Preferences.h>
 #include <Dynamixel2Arduino.h>
 
 HardwareSerial& DXL_SERIAL = Serial1;
 #define DEBUG_SERIAL Serial
-#define ENABLE_DEBUG_PRINT
+//#define ENABLE_DEBUG_PRINT
+
+using namespace m5avatar;
+Avatar avatar;
+Face* tairinFace;
+
+Face* createTairinFace(){
+  Face* f;
+  f = new Face(
+    new tairinMouth(50, 90, 4, 60),
+    new tairinEye(8, false),
+    new tairinEye(8, true),
+    new Eyeblow(32, 0, false),
+    new Eyeblow(32, 0, true)
+  );
+  return f;
+}
 
 // Contoller Params. 
 const TickType_t xPeriodMs = 10;  // [milli sec]
@@ -245,14 +266,15 @@ void setup(){
   
   const uint32_t MEMORY_STACK = 8192;
   const UBaseType_t PRIORIRY_SPIN_MAIN = 5;
-  //const BaseType_t ID_CORE_CTRL_MAIN = 0;
-  xTaskCreatePinnedToCore(controlLoopTask, "Control Loop Task", MEMORY_STACK, NULL, PRIORIRY_SPIN_MAIN, NULL, 0);
+  const BaseType_t ID_CORE_CTRL_MAIN = 0;
+  xTaskCreatePinnedToCore(controlLoopTask, "Control Loop Task", MEMORY_STACK, NULL, PRIORIRY_SPIN_MAIN, NULL, ID_CORE_CTRL_MAIN);
+  
   const UBaseType_t PRIORIRY_SPIN_SUB = 2;
-  //const BaseType_t ID_CORE_CTRL_SUB = 0;
-  xTaskCreatePinnedToCore(uiLoopTask,      "UI Loop Task",      MEMORY_STACK, NULL, PRIORIRY_SPIN_SUB,  NULL, 1);
+  const BaseType_t ID_CORE_CTRL_SUB = 1;
+  xTaskCreatePinnedToCore(uiLoopTask,      "UI Loop Task",      MEMORY_STACK, NULL, PRIORIRY_SPIN_SUB,  NULL, ID_CORE_CTRL_SUB);
 }
 
 
 void loop(){
-
+  
 }
