@@ -36,8 +36,8 @@ By constructing a 3D printed body with M5Stack Core2 and DYNAMIXEL XL330 as the 
 ## Environment
 - PlatformIO on Visual Studio Code
 - ~~Arduino IDE on Windows 11 (please apply M5Stack setting)~~
-
 **NOTE**
+
 このリポジトリではArduino IDEのサポートのサポートを終了しました．
 `for_arduino_ide`に以前までのコードを保存しているので，サンプルとしての利用は可能です．
 Arduino IDEで開発される場合は，これをベースにPIO向けのコードの内容を手動で反映させることでお使いいただけます．
@@ -70,3 +70,4 @@ If you are developing with Arduino IDE, you can use this as a base by manually r
 - M5Unified: [https://github.com/m5stack/M5Unified](https://github.com/m5stack/M5Unified)
 
 - TKJElectronics KalmanFilter Library: [https://github.com/TKJElectronics/KalmanFilter](https://github.com/TKJElectronics/KalmanFilter)
+
