@@ -36,6 +36,7 @@ By constructing a 3D printed body with M5Stack Core2 and DYNAMIXEL XL330 as the 
 ## Environment
 - PlatformIO on Visual Studio Code
 - ~~Arduino IDE on Windows 11 (please apply M5Stack setting)~~
+
 **NOTE**
 
 このリポジトリではArduino IDEのサポートのサポートを終了しました．
