@@ -245,8 +245,6 @@ void setup(){
 
   DEBUG_SERIAL.begin(115200);
 
-  drawCtrlPanel();
-
   // DYNAMIXEL Settings
   DXL_SERIAL.begin(2000000, SERIAL_8N1, 32, 33);
   dxl = Dynamixel2Arduino(DXL_SERIAL);
