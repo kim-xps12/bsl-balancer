@@ -25,18 +25,6 @@ void tairinMouth::draw(M5Canvas *spi, BoundingRect rect, DrawContext *ctx) {
   int x_lip = rect.getLeft() - w_lip / 2;
   int y_lip = rect.getTop()  - h_lip / 2 + breath * 2;
   spi->fillRect(x_lip, y_lip, w_lip, h_lip, primaryColor);
-
-  uint32_t x = rect.getCenterX();
-  uint32_t y = rect.getCenterY();
-  uint32_t r = 25;
-  uint32_t offsetX = 100; //w_lip /2;
-  uint32_t offsetY = 20;//-(r-1) - breath*2;
-  
-  spi->drawCircle(x + offsetX, y + offsetY, r, primaryColor);
-  spi->drawCircle(x + offsetX+1, y + offsetY, r, primaryColor);
-
-  spi->drawCircle(x - offsetX, y + offsetY, r, primaryColor);
-  spi->drawCircle(x - offsetX-1, y + offsetY, r, primaryColor);
 }
 
 }  // namespace m5avatar
