@@ -1,11 +1,18 @@
-# BSL-Balancer
+# BSL-Balancer (ﾀｲﾘﾝﾁｬﾝ)
 
 ## About
 BSL-Balancerは手乗りサイズの学習向け対向二輪型倒立振子です．
 M5Stack Core2とDYNAMIXEL XL330を主軸に3Dプリンタ製のボディで構成することで，コストと性能のバランス両立を目指しました．
+ｽﾀｯｸﾁｬﾝ*と同じ[m5stack-avatar](https://github.com/meganetaaan/m5stack-avatar)による顔を設定することで親しみやすいデザインに．対向二輪型倒立振子タイプのｽﾀｯｸﾁｬﾝ，「ﾀｲﾘﾝﾁｬﾝ」とお呼びください．画面右上の髪飾りは大輪の花を表しています．
 
 BSL-Balancer is a Palm-sized, two-wheeled inverted pendulum educational use.
 By constructing a 3D printed body with M5Stack Core2 and DYNAMIXEL XL330 as the main components, I aimed to achieve a balance between cost and performance.
+It has a friendly design with a face created by [m5stack-avatar](https://github.com/meganetaaan/m5stack-avatar), which is the same as stack-chan*. This is a two-wheeled inverted pendulum type Stack Chan, please call me "Tairin-chan".The hair ornament at the top right of the screen represents a "large flower (in japanese, Tairin-no-hana)."
+
+*ｽﾀｯｸﾁｬﾝは[ししかわ](https://twitter.com/stack_chan)さんが開発，公開している， 手乗りサイズのｽｰﾊﾟｰｶﾜｲｲコミュニケーションロボットです．リポジトリ：https://github.com/meganetaaan/stack-chan
+
+*stack-chan is a hand-sized super cute communication robot developed and published by [Shishikawa](https://twitter.com/stack_chan)-san. Repository: https://github.com/meganetaaan/stack-chan
+
 
 **front**
 ![front](./docs/front.jpg)
@@ -24,8 +31,8 @@ By constructing a 3D printed body with M5Stack Core2 and DYNAMIXEL XL330 as the 
 | Servo IF Board | B-SKY Lab Original Board | 1 pc. | [GitHub](https://github.com/kim-xps12/m5stack_board_dynamixel_ttl_rs3485) |
 | Cable | M5STACK-CABLE-10 | 1 pc. | [SWITCH SCIENCE](https://www.switch-science.com/products/5213 "https://www.switch-science.com/products/5213"), <br> [Sengoku](https://www.sengoku.co.jp/mod/sgk_cart/detail.php?code=EEHD-5CLV) |
 | Tire Unit | TAMIYA Narrow Tire | 1 set | [Amazon](https://amzn.asia/d/4A3hlcZ) |
-| Battery | AAA Type | 3 pcs. | \-  |
-| Battery Box | SBH-441AS | 1 pc. | [Akitsuki](https://akizukidenshi.com/catalog/g/g100735/) |
+| Battery | AAA Type | 4 pcs. | \-  |
+| Battery Box | SBH-441AS | 1 pc. | [Akizuki](https://akizukidenshi.com/catalog/g/g100735/) |
 | Body (3D-Printed Parts) | B-SKY Lab Original parts  | 1 set | This repository |
 | Magnet | D=6mm, t=3mm| 4 pcs. | [DAISO](https://jp.daisonet.com/products/4549131156621) |
 | M3 Hex Nut | class 1 in JIS | 10 pcs. |-|
