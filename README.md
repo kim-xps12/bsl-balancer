@@ -31,8 +31,8 @@ It has a friendly design with a face created by [m5stack-avatar](https://github.
 | Servo IF Board | B-SKY Lab Original Board | 1 pc. | [GitHub](https://github.com/kim-xps12/m5stack_board_dynamixel_ttl_rs3485) |
 | Cable | M5STACK-CABLE-10 | 1 pc. | [SWITCH SCIENCE](https://www.switch-science.com/products/5213 "https://www.switch-science.com/products/5213"), <br> [Sengoku](https://www.sengoku.co.jp/mod/sgk_cart/detail.php?code=EEHD-5CLV) |
 | Tire Unit | TAMIYA Narrow Tire | 1 set | [Amazon](https://amzn.asia/d/4A3hlcZ) |
-| Battery | AAA Type | 4 pcs. | \-  |
-| Battery Box | SBH-441AS | 1 pc. | [Akizuki](https://akizukidenshi.com/catalog/g/g100735/) |
+| Battery | AAA Type | 3 pcs. | \-  |
+| Battery Box | SBH-431-1AS150 | 1 pc. | [Akizuki](https://akizukidenshi.com/catalog/g/g103196/) |
 | Body (3D-Printed Parts) | B-SKY Lab Original parts  | 1 set | This repository |
 | Magnet | D=6mm, t=3mm| 4 pcs. | [DAISO](https://jp.daisonet.com/products/4549131156621) |
 | M3 Hex Nut | class 1 in JIS | 10 pcs. |-|
