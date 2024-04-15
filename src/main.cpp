@@ -148,6 +148,10 @@ void drawCtrlPanel(){
   drawButton("Kp", 20, 70, Kp);
   drawButton("Ki", 20, 110, Ki);
   drawButton("Kd", 20, 150, Kd);
+
+  M5.Display.setCursor(20, 190);
+  int batteryPercentage = M5.Power.getBatteryLevel();
+  M5.Display.printf("M5Core2 Battery: %d%%", batteryPercentage);
 }
 
 
