@@ -58,6 +58,49 @@ If you are developing with Arduino IDE, you can use this as a base by manually r
 - please refer **fron** and **back** view.
 - manual: coming soon !
 
+## Usage
+
+### How to stand up
+
+1. 電池ボックスの電源スイッチをONにします
+    Turn on the power switch on the battery box.
+1. M5Stack Core2の画面が鉛直になるように手で支えて保持します
+    Manually hold and support the M5Stack Core2 so that its screen is vertical.
+1. M5Stack Core2の電源をONにします
+    Turn on the power of the M5Stack Core2.
+1. ゆっくりと手を離すと倒立します
+    Release your hand and it will stand up.
+
+
+もし難しい場合は，次の手順を試してみてください．
+If you find this difficult, please try the following steps:
+
+1. 先にM5Stack Core2の電源をONにします
+    First, turn on the power of the M5Stack Core2.
+1. 電池ボックスの電源スイッチをONにします
+    Turn on the power switch on the battery box.
+1. M5Stack Core2の画面が鉛直になるように手で支えて保持します
+    Manually hold and support the M5Stack Core2 so that its screen is vertical.
+1. M5Stack Core2のリセットボタン（本体下部側のボタン）を短く押して離します
+    Press shortly and release the reset button located at the bottom side of the device.
+1. ゆっくりと手を離すと倒立します
+    Release your hand and it will stand up.
+
+
+
+### How to tune parameters
+
+1. ボタンB（中央）をタップしてコントロールパネルを表示します
+    Tap the B button (middle) to display the control panel.
+1. [+]ボタンまたは[-]ボタンでパラメータ（P, I, D各ゲインと目標角度）を変更できます
+    Use the [+] or [-] buttons to change parameters (P, I, D gains, and target angle).
+
+**NOTE**
+設定したパラメータは電源の再投入などのリセットで失われます．EEPROMに保存する機能は今後追加される予定です．
+
+The configured parameters will be lost upon reset, such as when the power is cycled. A feature to save settings to EEPROM will be added in the future.
+
+
 
 ## Reference
 
