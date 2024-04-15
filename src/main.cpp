@@ -43,18 +43,15 @@ float I = 0.0;
 float D = 0.0;
 float preP = 0.0;
 
-
 // Kalman filter Params.
 Kalman kalman;
 float accX, accY, accZ;
 float gyroX, gyroY, gyroZ;
 
-
 // Contoller Values
 unsigned long previousTimestamp = 0;
 unsigned long currentTimestamp = 0;
 unsigned long elapsedTime = 0;
-
 
 // DYNAMIXEL Params.
 const uint8_t DXL_ID_L = 0;
@@ -62,6 +59,7 @@ const uint8_t DXL_ID_R = 1;
 const float DXL_PROTOCOL_VERSION = 2.0;
 
 Dynamixel2Arduino dxl;//(DXL_SERIAL);
+
 
 float getPitch(){
   M5.Imu.getAccelData(&accX, &accY, &accZ);
@@ -130,14 +128,14 @@ void calcPID(){
 
 
 void drawButton(const char* label, int x, int y, float value) {
-  // ボタンの描画
+  // draw button
   M5.Display.drawRect(x, y, 50, 30, WHITE);
   M5.Display.drawString("-", x+20, y, 2);
 
   M5.Display.drawRect(x+200, y, 50, 30, WHITE);
   M5.Display.drawString("+", x+200+20, y, 2);
   
-  // ラベルと値の描画
+  // draw label and value
   M5.Display.setCursor(x+70, y+5);
   M5.Display.print(label);
   M5.Display.print(": ");
@@ -189,7 +187,8 @@ void controlLoopTask(void *pvParameters) {
     }
 }
 
-bool showingCtrlPanel = false;
+
+bool enShowCtrlPanel = false;
 void uiLoopTask(void *pvParameters){
   
   TickType_t xLastWakeTime = xTaskGetTickCount();  
@@ -203,19 +202,19 @@ void uiLoopTask(void *pvParameters){
 
     // show tuning panel
     if (M5.BtnB.wasPressed()) {
-      if (showingCtrlPanel) {
-        showingCtrlPanel = false;
+      if (enShowCtrlPanel) {
+        enShowCtrlPanel = false;
         avatar.resume();
         M5.Lcd.clear();
       } else {
-        showingCtrlPanel = true;
+        enShowCtrlPanel = true;
         avatar.suspend();
         M5.Lcd.clear();
         drawCtrlPanel();
       }
     }
     
-    if (showingCtrlPanel) {
+    if (enShowCtrlPanel) {
       bool isReleased = true;
         if (M5.Touch.getCount()>0 && isReleased) {
           isReleased = false;
@@ -229,26 +228,25 @@ void uiLoopTask(void *pvParameters){
 
 void setup(){
 
+  DEBUG_SERIAL.begin(115200);
+
   // M5 Settings
   M5.begin();
   M5.Lcd.fillScreen(BLACK);
   M5.Lcd.setTextSize(2);
   M5.Lcd.setCursor(0, 0);
-  
   M5.Imu.init();
   // M5.Imu.setAccelFsr(M5.Imu.AFS_2G);
   // M5.Imu.setGyroFsr(M5.Imu.GFS_250DPS);
 
+  // M5 avatar Settings
   tairinFace = createTairinFace();
   avatar.setFace(tairinFace);
   avatar.init();
 
-  DEBUG_SERIAL.begin(115200);
-
   // DYNAMIXEL Settings
   DXL_SERIAL.begin(2000000, SERIAL_8N1, 32, 33);
   dxl = Dynamixel2Arduino(DXL_SERIAL);
-
   dxl.begin(2000000);  // DYNAMIXEL baudrate.
   dxl.setPortProtocolVersion(DXL_PROTOCOL_VERSION);
   dxl.ping(DXL_ID_L);
@@ -260,8 +258,10 @@ void setup(){
   dxl.torqueOn(DXL_ID_L);
   dxl.torqueOn(DXL_ID_R);
 
+  // Kalman filter Setting
   kalman.setAngle(getPitch());
   
+  // RTOS Task Settings
   const uint32_t MEMORY_STACK = 8192;
   const UBaseType_t PRIORIRY_SPIN_MAIN = 5;
   const BaseType_t ID_CORE_CTRL_MAIN = 0;
