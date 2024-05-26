@@ -33,6 +33,8 @@ It has a friendly design with a face created by [m5stack-avatar](https://github.
 | Tire Unit | TAMIYA Narrow Tire | 1 set | [Amazon](https://amzn.asia/d/4A3hlcZ) |
 | Battery | AAA Type | 3 pcs. | \-  |
 | Battery Box | SBH-431-1AS150 | 1 pc. | [Akizuki](https://akizukidenshi.com/catalog/g/g103196/) |
+| XH Connector Housing| XHP-2 | 1 pc. | [Akizuki](https://akizukidenshi.com/catalog/g/g112255/) |
+| XH Connector Contact| SXH-001T-P0.6 | 1 pack | [Akizuki](https://akizukidenshi.com/catalog/g/g112264/) |
 | Body (3D-Printed Parts) | B-SKY Lab Original parts  | 1 set | This repository |
 | Magnet | D=6mm, t=3mm| 4 pcs. | [DAISO](https://jp.daisonet.com/products/4549131156621) |
 | M3 Hex Nut | class 1 in JIS | 10 pcs. |-|
@@ -58,32 +60,56 @@ If you are developing with Arduino IDE, you can use this as a base by manually r
 - please refer **fron** and **back** view.
 - manual: coming soon !
 
+### Battery Box
+
+[基板のREADMEのピンアサイン](https://github.com/kim-xps12/m5stack_board_dynamixel_ttl_rs3485?tab=readme-ov-file#pin-assign)を参考に，電池ボックスにXHコネクタを取り付けてください．
+
+Crimp the XH connector to the battery box, referring to the [pin assignment in the README of the board](https://github.com/kim-xps12/m5stack_board_dynamixel_ttl_rs3485?tab=readme-ov-file#pin-assign).
+
+
 ## Usage
 
 ### How to stand up
 
 1. 電池ボックスの電源スイッチをONにします
+    
     Turn on the power switch on the battery box.
+   
 1. M5Stack Core2の画面が鉛直になるように手で支えて保持します
+
     Manually hold and support the M5Stack Core2 so that its screen is vertical.
+
 1. M5Stack Core2の電源をONにします
+
     Turn on the power of the M5Stack Core2.
+
 1. ゆっくりと手を離すと倒立します
+
     Release your hand and it will stand up.
 
 
 もし難しい場合は，次の手順を試してみてください．
+
 If you find this difficult, please try the following steps:
 
 1. 先にM5Stack Core2の電源をONにします
+
     First, turn on the power of the M5Stack Core2.
+
 1. 電池ボックスの電源スイッチをONにします
+
     Turn on the power switch on the battery box.
+
 1. M5Stack Core2の画面が鉛直になるように手で支えて保持します
+
     Manually hold and support the M5Stack Core2 so that its screen is vertical.
+   
 1. M5Stack Core2のリセットボタン（本体下部側のボタン）を短く押して離します
+
     Press shortly and release the reset button located at the bottom side of the device.
+
 1. ゆっくりと手を離すと倒立します
+
     Release your hand and it will stand up.
 
 
@@ -91,8 +117,11 @@ If you find this difficult, please try the following steps:
 ### How to tune parameters
 
 1. ボタンB（中央）をタップしてコントロールパネルを表示します
+
     Tap the B button (middle) to display the control panel.
+
 1. [+]ボタンまたは[-]ボタンでパラメータ（P, I, D各ゲインと目標角度）を変更できます
+
     Use the [+] or [-] buttons to change parameters (P, I, D gains, and target angle).
 
 **NOTE**
