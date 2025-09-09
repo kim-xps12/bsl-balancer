@@ -66,6 +66,11 @@ If you are developing with Arduino IDE, you can use this as a base by manually r
 
 Crimp the XH connector to the battery box, referring to the [pin assignment in the README of the board](https://github.com/kim-xps12/m5stack_board_dynamixel_ttl_rs3485?tab=readme-ov-file#pin-assign).
 
+### Change baudrate of XL330
+
+お好みのDYNAMIXEL開発環境，あるいは[m5core2_dynamixel_wizard](https://github.com/kim-xps12/m5core2_dynamixel_wizard)をM5Stack Core2へ書き込んで利用し，使用するDYNAMIXEL XL330のBaudrateを`2000000`に設定してください．
+
+Use your preferred DYNAMIXEL development environment or [m5core2_dynamixel_wizard](https://github.com/kim-xps12/m5core2_dynamixel_wizard) to write it to the M5Stack Core2 and set the Baudrate of the DYNAMIXEL XL330 you are using to `2000000`.
 
 ## Usage
 
