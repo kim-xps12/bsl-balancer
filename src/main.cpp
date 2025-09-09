@@ -14,6 +14,7 @@ HardwareSerial& DXL_SERIAL = Serial1;
 #define DEBUG_SERIAL Serial
 //#define ENABLE_DEBUG_PRINT
 
+
 using namespace m5avatar;
 Avatar avatar;
 Face* tairinFace;
@@ -29,6 +30,10 @@ Face* createTairinFace(){
   );
   return f;
 }
+
+// M5Stack Core2 PORT A pin configuration
+const uint8_t PIN_RX_SERVO = 33;
+const uint8_t PIN_TX_SERVO = 32;
 
 // Contoller Params. 
 const TickType_t xPeriodMs = 10;  // [milli sec]
@@ -249,7 +254,7 @@ void setup(){
   avatar.init();
 
   // DYNAMIXEL Settings
-  DXL_SERIAL.begin(2000000, SERIAL_8N1, 32, 33);
+  DXL_SERIAL.begin(2000000, SERIAL_8N1, PIN_RX_SERVO, PIN_TX_SERVO);
   dxl = Dynamixel2Arduino(DXL_SERIAL);
   dxl.begin(2000000);  // DYNAMIXEL baudrate.
   dxl.setPortProtocolVersion(DXL_PROTOCOL_VERSION);
