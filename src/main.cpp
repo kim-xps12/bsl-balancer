@@ -272,13 +272,13 @@ void setup(){
   
   // RTOS Task Settings
   const uint32_t MEMORY_STACK = 8192;
-  const UBaseType_t PRIORIRY_SPIN_MAIN = 5;
-  const BaseType_t ID_CORE_CTRL_MAIN = 0;
-  xTaskCreatePinnedToCore(controlLoopTask, "Control Loop Task", MEMORY_STACK, NULL, PRIORIRY_SPIN_MAIN, NULL, ID_CORE_CTRL_MAIN);
-  
-  const UBaseType_t PRIORIRY_SPIN_SUB = 2;
-  const BaseType_t ID_CORE_CTRL_SUB = 1;
-  xTaskCreatePinnedToCore(uiLoopTask,      "UI Loop Task",      MEMORY_STACK, NULL, PRIORIRY_SPIN_SUB,  NULL, ID_CORE_CTRL_SUB);
+  const UBaseType_t PRIORITY_CTRL = 20;
+  const BaseType_t CORE_CTRL = 1;
+  xTaskCreatePinnedToCore(controlLoopTask, "Control Loop Task", MEMORY_STACK, NULL, PRIORITY_CTRL, NULL, CORE_CTRL);
+
+  const UBaseType_t PRIORITY_UI = 3;
+  const BaseType_t CORE_UI = 0;
+  xTaskCreatePinnedToCore(uiLoopTask,      "UI Loop Task",      MEMORY_STACK, NULL, PRIORITY_UI,   NULL, CORE_UI);
 }
 
 
