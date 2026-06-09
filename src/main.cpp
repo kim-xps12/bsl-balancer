@@ -9,6 +9,7 @@
 #include <Kalman.h>
 #include <Preferences.h>
 #include <Dynamixel2Arduino.h>
+#include <esp_task_wdt.h>
 
 HardwareSerial& DXL_SERIAL = Serial1;
 #define DEBUG_SERIAL Serial
@@ -188,9 +189,11 @@ void handleCtrlPanelTouched(){
 
 
 void controlLoopTask(void *pvParameters) {
+    esp_task_wdt_add(NULL);
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
     while(true) {
+      esp_task_wdt_reset();
       calcPID();
       vTaskDelayUntil(&xLastWakeTime, xPeriodMs);
     }
@@ -270,6 +273,9 @@ void setup(){
   // Kalman filter Setting
   kalman.setAngle(getPitch());
   
+  // WDT: I2C ハング等で制御ループが停止した場合にシステムリセット
+  esp_task_wdt_init(1, true);  // 1秒タイムアウト、panic=true
+
   // RTOS Task Settings
   const uint32_t MEMORY_STACK = 8192;
   const UBaseType_t PRIORITY_CTRL = 20;
