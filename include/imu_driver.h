@@ -14,6 +14,8 @@ public:
     Data update(float dt);
 
     void calibrate(uint16_t n_samples = 500, float max_stddev_deg = 0.5f);
+    bool loadNVS();
+    void saveNVS();
 
     float pitchEstimate() const { return _pitch_est * RAD_TO_DEG; }
 

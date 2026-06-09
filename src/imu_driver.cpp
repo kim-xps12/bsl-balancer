@@ -1,5 +1,6 @@
 #include "imu_driver.h"
 #include <cmath>
+#include <Preferences.h>
 
 void ImuDriver::begin(SemaphoreHandle_t i2c_mutex) {
     _i2c_mutex = i2c_mutex;
@@ -67,4 +68,31 @@ void ImuDriver::calibrate(uint16_t n_samples, float max_stddev_deg) {
     _gyro_bias = 0.0f;
 
     Serial.printf("IMU cal: pitch=%.2f deg, stddev=%.3f (%d samples)\n", mean, stddev, n_samples);
+}
+
+bool ImuDriver::loadNVS() {
+    Preferences prefs;
+    prefs.begin("imu_cal", true);
+    if (!prefs.isKey("pitch_init")) {
+        prefs.end();
+        return false;
+    }
+    float pitch_init = prefs.getFloat("pitch_init", 0.0f);
+    float bias = prefs.getFloat("gyro_bias", 0.0f);
+    prefs.end();
+
+    _pitch_est = pitch_init * DEG_TO_RAD;
+    _gyro_bias = bias;
+
+    Serial.printf("IMU NVS load: pitch=%.2f deg, bias=%.4f rad/s\n", pitch_init, bias);
+    return true;
+}
+
+void ImuDriver::saveNVS() {
+    Preferences prefs;
+    prefs.begin("imu_cal", false);
+    prefs.putFloat("pitch_init", _pitch_est * RAD_TO_DEG);
+    prefs.putFloat("gyro_bias", _gyro_bias);
+    prefs.end();
+    Serial.println("IMU cal saved to NVS");
 }

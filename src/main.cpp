@@ -306,10 +306,13 @@ void setup() {
     dxl.torqueOn(DXL_ID_L);
     dxl.torqueOn(DXL_ID_R);
 
-    // IMU driver init + calibration
+    // IMU driver init
     imuDriver.begin(g_i2c_mutex);
-    M5.Lcd.println("Calibrating...");
-    imuDriver.calibrate(500, 0.5f);
+    if (!imuDriver.loadNVS()) {
+        M5.Lcd.println("Calibrating...");
+        imuDriver.calibrate(500, 0.5f);
+        imuDriver.saveNVS();
+    }
     M5.Lcd.println("Ready!");
 
     // WDT
