@@ -254,9 +254,9 @@ void setup(){
   avatar.init();
 
   // DYNAMIXEL Settings
-  DXL_SERIAL.begin(2000000, SERIAL_8N1, PIN_RX_SERVO, PIN_TX_SERVO);
+  DXL_SERIAL.begin(1000000, SERIAL_8N1, PIN_RX_SERVO, PIN_TX_SERVO);
   dxl = Dynamixel2Arduino(DXL_SERIAL);
-  dxl.begin(2000000);  // DYNAMIXEL baudrate.
+  dxl.begin(1000000);  // DYNAMIXEL baudrate.
   dxl.setPortProtocolVersion(DXL_PROTOCOL_VERSION);
   dxl.ping(DXL_ID_L);
   dxl.ping(DXL_ID_R);
