@@ -19,7 +19,7 @@ const float DEFAULT_KP = 15.0f;
 const float DEFAULT_KI = 0.05f;
 const float DEFAULT_KD = 0.0f;
 const float DEFAULT_PITCH_TARGET = 86.0f;
-const TickType_t xPeriodMs = 10;
+const TickType_t CTRL_PERIOD_TICKS = pdMS_TO_TICKS(5);  // 200Hz
 
 // DYNAMIXEL Params.
 const uint8_t DXL_ID_L = 0;
@@ -102,7 +102,7 @@ void controlLoopTask(void *pvParameters) {
         // IMU read + Mahony fusion
         auto imu = imuDriver.update(dt);
         if (!imu.valid) {
-            vTaskDelayUntil(&xLastWakeTime, xPeriodMs);
+            vTaskDelayUntil(&xLastWakeTime, CTRL_PERIOD_TICKS);
             continue;
         }
 
@@ -120,7 +120,7 @@ void controlLoopTask(void *pvParameters) {
             TelemetryData tel = {pitch_filtered, imu.pitch_rate_dps, 0, 0, 0, 0,
                                  (uint32_t)(esp_timer_get_time() - now_us), true};
             xQueueOverwrite(g_telemetry_queue, &tel);
-            vTaskDelayUntil(&xLastWakeTime, xPeriodMs);
+            vTaskDelayUntil(&xLastWakeTime, CTRL_PERIOD_TICKS);
             continue;
         }
 
@@ -152,7 +152,7 @@ void controlLoopTask(void *pvParameters) {
                              P_val, I_acc, D_val, elapsed, false};
         xQueueOverwrite(g_telemetry_queue, &tel);
 
-        vTaskDelayUntil(&xLastWakeTime, xPeriodMs);
+        vTaskDelayUntil(&xLastWakeTime, CTRL_PERIOD_TICKS);
     }
 }
 
