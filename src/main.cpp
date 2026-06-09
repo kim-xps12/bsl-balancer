@@ -2,11 +2,11 @@
 
 #include <M5Unified.h>
 
-#include <Kalman.h>
 #include <Preferences.h>
 #include <Dynamixel2Arduino.h>
 #include <esp_task_wdt.h>
 #include <esp_timer.h>
+#include "imu_driver.h"
 
 HardwareSerial& DXL_SERIAL = Serial1;
 
@@ -15,9 +15,9 @@ const uint8_t PIN_RX_SERVO = 33;
 const uint8_t PIN_TX_SERVO = 32;
 
 // Default controller params
-const float DEFAULT_KP = 50.0f;
-const float DEFAULT_KI = 1.0f;
-const float DEFAULT_KD = 1.0f;
+const float DEFAULT_KP = 15.0f;
+const float DEFAULT_KI = 0.05f;
+const float DEFAULT_KD = 0.0f;
 const float DEFAULT_PITCH_TARGET = 86.0f;
 const TickType_t xPeriodMs = 10;
 
@@ -27,7 +27,7 @@ const uint8_t DXL_ID_R = 1;
 const float DXL_PROTOCOL_VERSION = 2.0;
 
 Dynamixel2Arduino dxl;
-Kalman kalman;
+ImuDriver imuDriver;
 
 // I2C bus mutex
 SemaphoreHandle_t g_i2c_mutex = nullptr;
@@ -51,23 +51,6 @@ struct TelemetryData {
 QueueHandle_t g_cmd_queue = nullptr;
 QueueHandle_t g_telemetry_queue = nullptr;
 
-// --- IMU burst read ---
-
-struct ImuData { float pitch_deg; float pitch_rate_dps; bool valid; };
-
-ImuData readImuBurst() {
-    ImuData r = {0, 0, false};
-    if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(2)) != pdTRUE) return r;
-    auto mask = M5.Imu.update();
-    xSemaphoreGive(g_i2c_mutex);
-    if (!mask) return r;
-    auto d = M5.Imu.getImuData();
-    r.pitch_deg = atan2f(d.accel.y, d.accel.z) * RAD_TO_DEG;
-    r.pitch_rate_dps = d.gyro.x;
-    r.valid = true;
-    return r;
-}
-
 // --- Motor drive ---
 
 void driveTire(int rpm) {
@@ -87,6 +70,8 @@ void controlLoopTask(void *pvParameters) {
     float target = DEFAULT_PITCH_TARGET;
     float I_acc = 0.0f;
     float preP = 0.0f;
+    float D_filtered = 0.0f;
+    bool pid_active = false;
     int64_t prev_us = 0;
 
     while (true) {
@@ -114,23 +99,25 @@ void controlLoopTask(void *pvParameters) {
         }
         prev_us = now_us;
 
-        // IMU burst read
-        ImuData imu = readImuBurst();
+        // IMU read + Mahony fusion
+        auto imu = imuDriver.update(dt);
         if (!imu.valid) {
             vTaskDelayUntil(&xLastWakeTime, xPeriodMs);
             continue;
         }
 
-        float pitch_kalman = kalman.getAngle(imu.pitch_deg, imu.pitch_rate_dps, dt);
+        float pitch_filtered = imu.pitch_deg;
 
-        float pitch_error = target - pitch_kalman;
+        float pitch_error = target - pitch_filtered;
 
         // Fall detection
         if (pitch_error < -40.0f || 40.0f < pitch_error) {
             driveTire(0);
             I_acc = 0.0f;
             preP = 0.0f;
-            TelemetryData tel = {pitch_kalman, imu.pitch_rate_dps, 0, 0, 0, 0,
+            D_filtered = 0.0f;
+            pid_active = false;
+            TelemetryData tel = {pitch_filtered, imu.pitch_rate_dps, 0, 0, 0, 0,
                                  (uint32_t)(esp_timer_get_time() - now_us), true};
             xQueueOverwrite(g_telemetry_queue, &tel);
             vTaskDelayUntil(&xLastWakeTime, xPeriodMs);
@@ -140,9 +127,19 @@ void controlLoopTask(void *pvParameters) {
         // PID
         float P_val = pitch_error;
         I_acc += P_val * dt;
-        float i_limit = 200.0f / (fabsf(ki) + 1e-6f);
+        float i_limit = 50.0f / (fabsf(ki) + 1e-6f);
         I_acc = constrain(I_acc, -i_limit, i_limit);
-        float D_val = (P_val - preP) / dt;
+
+        float D_raw;
+        if (!pid_active) {
+            D_raw = 0.0f;
+            pid_active = true;
+        } else {
+            D_raw = (P_val - preP) / dt;
+        }
+        // Low-pass filter on D term (alpha=0.2: heavy smoothing)
+        D_filtered = 0.2f * D_raw + 0.8f * D_filtered;
+        float D_val = D_filtered;
         preP = P_val;
 
         float rpm_f = kp * P_val + ki * I_acc + kd * D_val;
@@ -151,7 +148,7 @@ void controlLoopTask(void *pvParameters) {
 
         // Telemetry (non-blocking overwrite)
         uint32_t elapsed = (uint32_t)(esp_timer_get_time() - now_us);
-        TelemetryData tel = {pitch_kalman, imu.pitch_rate_dps, (float)rpm_motor,
+        TelemetryData tel = {pitch_filtered, imu.pitch_rate_dps, (float)rpm_motor,
                              P_val, I_acc, D_val, elapsed, false};
         xQueueOverwrite(g_telemetry_queue, &tel);
 
@@ -309,9 +306,11 @@ void setup() {
     dxl.torqueOn(DXL_ID_L);
     dxl.torqueOn(DXL_ID_R);
 
-    // Kalman filter init
-    ImuData imu_init = readImuBurst();
-    kalman.setAngle(imu_init.valid ? imu_init.pitch_deg : DEFAULT_PITCH_TARGET);
+    // IMU driver init + calibration
+    imuDriver.begin(g_i2c_mutex);
+    M5.Lcd.println("Calibrating...");
+    imuDriver.calibrate(500, 0.5f);
+    M5.Lcd.println("Ready!");
 
     // WDT
     esp_task_wdt_init(1, true);
