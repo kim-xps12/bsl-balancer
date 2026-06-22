@@ -1,0 +1,158 @@
+<svg host="65bd71144e" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" width="600px" height="1020px" viewBox="50.0 0.0 600.0 1020.0" style="background: transparent;" content="&lt;mxfile host=&quot;65bd71144e&quot;&gt;
+    &lt;diagram name=&quot;Control Loop&quot; id=&quot;ctrl-loop&quot;&gt;
+        &lt;mxGraphModel dx=&quot;800&quot; dy=&quot;600&quot; grid=&quot;1&quot; gridSize=&quot;10&quot; guides=&quot;1&quot; tooltips=&quot;1&quot; connect=&quot;1&quot; arrows=&quot;1&quot; fold=&quot;1&quot; page=&quot;1&quot; pageScale=&quot;1&quot; pageWidth=&quot;827&quot; pageHeight=&quot;1169&quot; math=&quot;0&quot; shadow=&quot;0&quot;&gt;
+            &lt;root&gt;
+                &lt;mxCell id=&quot;0&quot;/&gt;
+                &lt;mxCell id=&quot;1&quot; parent=&quot;0&quot;/&gt;
+                &lt;mxCell id=&quot;2&quot; value=&quot;WDT Reset + Command Queue&amp;#xa;(PID + Speed commands)&quot; style=&quot;rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;fontStyle=1;&quot; parent=&quot;1&quot; vertex=&quot;1&quot;&gt;
+                    &lt;mxGeometry x=&quot;95&quot; y=&quot;10&quot; width=&quot;260&quot; height=&quot;45&quot; as=&quot;geometry&quot;/&gt;
+                &lt;/mxCell&gt;
+                &lt;mxCell id=&quot;3&quot; value=&quot;dt calc + IMU update (Mahony)&quot; style=&quot;rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;fontStyle=1;&quot; parent=&quot;1&quot; vertex=&quot;1&quot;&gt;
+                    &lt;mxGeometry x=&quot;95&quot; y=&quot;80&quot; width=&quot;260&quot; height=&quot;45&quot; as=&quot;geometry&quot;/&gt;
+                &lt;/mxCell&gt;
+                &lt;mxCell id=&quot;4&quot; value=&quot;IMU valid?&quot; style=&quot;rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;fontStyle=1;&quot; parent=&quot;1&quot; vertex=&quot;1&quot;&gt;
+                    &lt;mxGeometry x=&quot;170&quot; y=&quot;155&quot; width=&quot;110&quot; height=&quot;60&quot; as=&quot;geometry&quot;/&gt;
+                &lt;/mxCell&gt;
+                &lt;mxCell id=&quot;5&quot; value=&quot;Fall detection&amp;#xa;|target - pitch| &gt; 40deg?&quot; style=&quot;rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;fontStyle=1;&quot; parent=&quot;1&quot; vertex=&quot;1&quot;&gt;
+                    &lt;mxGeometry x=&quot;140&quot; y=&quot;250&quot; width=&quot;170&quot; height=&quot;70&quot; as=&quot;geometry&quot;/&gt;
+                &lt;/mxCell&gt;
+                &lt;mxCell id=&quot;7&quot; value=&quot;Fall: Motor OFF&amp;#xa;PID + Speed Reset&quot; style=&quot;rounded=1;whiteSpace=wrap;html=1;fillColor=#fdedec;strokeColor=#e74c3c;fontSize=12;fontStyle=1;&quot; parent=&quot;1&quot; vertex=&quot;1&quot;&gt;
+                    &lt;mxGeometry x=&quot;420&quot; y=&quot;260&quot; width=&quot;160&quot; height=&quot;50&quot; as=&quot;geometry&quot;/&gt;
+                &lt;/mxCell&gt;
+                &lt;mxCell id=&quot;20&quot; value=&quot;Speed outer loop (25 Hz)&amp;#xa;Sync Read → Speed PI → θ_offset&amp;#xa;(back-calc anti-windup)&quot; style=&quot;rounded=1;whiteSpace=wrap;html=1;fillColor=#fce5cd;strokeColor=#d79b00;fontSize=12;fontStyle=1;&quot; parent=&quot;1&quot; vertex=&quot;1&quot;&gt;
+                    &lt;mxGeometry x=&quot;75&quot; y=&quot;360&quot; width=&quot;300&quot; height=&quot;65&quot; as=&quot;geometry&quot;/&gt;
+                &lt;/mxCell&gt;
+                &lt;mxCell id=&quot;21&quot; value=&quot;effective_target = target - θ_offset&quot; style=&quot;rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;fontStyle=1;&quot; parent=&quot;1&quot; vertex=&quot;1&quot;&gt;
+                    &lt;mxGeometry x=&quot;80&quot; y=&quot;460&quot; width=&quot;290&quot; height=&quot;40&quot; as=&quot;geometry&quot;/&gt;
+                &lt;/mxCell&gt;
+                &lt;mxCell id=&quot;8&quot; value=&quot;Inner PID/PD&amp;#xa;Speed: D=-rate (on-measurement)&amp;#xa;Normal: D=LPF(dP/dt, α=0.2)&quot; style=&quot;rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;fontStyle=1;&quot; parent=&quot;1&quot; vertex=&quot;1&quot;&gt;
+                    &lt;mxGeometry x=&quot;75&quot; y=&quot;535&quot; width=&quot;300&quot; height=&quot;65&quot; as=&quot;geometry&quot;/&gt;
+                &lt;/mxCell&gt;
+                &lt;mxCell id=&quot;9&quot; value=&quot;Speed: rpm = Kp*P + Kd*D&amp;#xa;Normal: rpm = Kp*P + Ki*I + Kd*D&amp;#xa;constrain(-300, +300)&quot; style=&quot;rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;fontStyle=1;&quot; parent=&quot;1&quot; vertex=&quot;1&quot;&gt;
+                    &lt;mxGeometry x=&quot;75&quot; y=&quot;635&quot; width=&quot;300&quot; height=&quot;60&quot; as=&quot;geometry&quot;/&gt;
+                &lt;/mxCell&gt;
+                &lt;mxCell id=&quot;10&quot; value=&quot;driveMotors(rpm, rpm)&amp;#xa;Sync Write Goal Velocity&quot; style=&quot;rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;fontStyle=1;&quot; parent=&quot;1&quot; vertex=&quot;1&quot;&gt;
+                    &lt;mxGeometry x=&quot;105&quot; y=&quot;730&quot; width=&quot;240&quot; height=&quot;45&quot; as=&quot;geometry&quot;/&gt;
+                &lt;/mxCell&gt;
+                &lt;mxCell id=&quot;11&quot; value=&quot;Telemetry send (overwrite)&amp;#xa;+speed fields&quot; style=&quot;rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;fontStyle=1;&quot; parent=&quot;1&quot; vertex=&quot;1&quot;&gt;
+                    &lt;mxGeometry x=&quot;105&quot; y=&quot;810&quot; width=&quot;240&quot; height=&quot;45&quot; as=&quot;geometry&quot;/&gt;
+                &lt;/mxCell&gt;
+                &lt;mxCell id=&quot;12&quot; value=&quot;vTaskDelayUntil (5ms)&quot; style=&quot;rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;fontStyle=1;&quot; parent=&quot;1&quot; vertex=&quot;1&quot;&gt;
+                    &lt;mxGeometry x=&quot;105&quot; y=&quot;890&quot; width=&quot;240&quot; height=&quot;40&quot; as=&quot;geometry&quot;/&gt;
+                &lt;/mxCell&gt;
+            &lt;/root&gt;
+        &lt;/mxGraphModel&gt;
+    &lt;/diagram&gt;
+&lt;/mxfile&gt;">
+    <defs>
+        <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#555"/>
+        </marker>
+    </defs>
+    <g>
+<!-- Box 1: WDT + Command Queue -->
+<rect x="95" y="10" width="260" height="45" rx="10" ry="10" fill="#dae8fc" stroke="#6c8ebf" stroke-width="2"/>
+<text x="225" y="30" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="12" font-weight="bold" fill="#333">WDT Reset + Command Queue</text>
+<text x="225" y="46" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="10" fill="#333">(PID + Speed commands)</text>
+
+<!-- Arrow 1→2 -->
+<line x1="225" y1="55" x2="225" y2="80" stroke="#555" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+<!-- Box 2: dt + IMU -->
+<rect x="95" y="80" width="260" height="45" rx="10" ry="10" fill="#dae8fc" stroke="#6c8ebf" stroke-width="2"/>
+<text x="225" y="108" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="12" font-weight="bold" fill="#333">dt calc + IMU update (Mahony)</text>
+
+<!-- Arrow 2→diamond -->
+<line x1="225" y1="125" x2="225" y2="155" stroke="#555" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+<!-- Diamond: IMU valid? -->
+<polygon points="225,155 280,185 225,215 170,185" fill="#fff2cc" stroke="#d6b656" stroke-width="2"/>
+<text x="225" y="190" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="12" font-weight="bold" fill="#333">IMU valid?</text>
+
+<!-- Diamond Yes arrow down -->
+<line x1="225" y1="215" x2="225" y2="250" stroke="#555" stroke-width="2" marker-end="url(#arrowhead)"/>
+<text x="233" y="236" font-family="Helvetica, sans-serif" font-size="11" font-weight="bold" fill="#82b366">Yes</text>
+
+<!-- Diamond No arrow right → 5ms wait -->
+<path d="M 280 185 L 620 185 L 620 890 L 345 890" fill="none" stroke="#e74c3c" stroke-width="2" marker-end="url(#arrowhead)"/>
+<text x="290" y="178" font-family="Helvetica, sans-serif" font-size="11" font-weight="bold" fill="#e74c3c">No</text>
+
+<!-- Diamond 2: Fall detection -->
+<polygon points="225,250 310,285 225,320 140,285" fill="#fff2cc" stroke="#d6b656" stroke-width="2"/>
+<text x="225" y="282" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="10" font-weight="bold" fill="#333">|target-pitch|</text>
+<text x="225" y="296" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="10" font-weight="bold" fill="#333">&gt; 40 deg?</text>
+
+<!-- Diamond2 No arrow down -->
+<line x1="225" y1="320" x2="225" y2="360" stroke="#555" stroke-width="2" marker-end="url(#arrowhead)"/>
+<text x="233" y="343" font-family="Helvetica, sans-serif" font-size="11" font-weight="bold" fill="#82b366">No</text>
+
+<!-- Diamond2 Yes arrow right → Fall box -->
+<line x1="310" y1="285" x2="420" y2="285" stroke="#e74c3c" stroke-width="2" marker-end="url(#arrowhead)"/>
+<text x="340" y="278" font-family="Helvetica, sans-serif" font-size="11" font-weight="bold" fill="#e74c3c">Yes</text>
+
+<!-- Fall box -->
+<rect x="420" y="260" width="160" height="50" rx="10" ry="10" fill="#fdedec" stroke="#e74c3c" stroke-width="2"/>
+<text x="500" y="280" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="12" font-weight="bold" fill="#e74c3c">Fall: Motor OFF</text>
+<text x="500" y="298" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="11" fill="#e74c3c">PID + Speed Reset</text>
+
+<!-- Fall → Telemetry -->
+<path d="M 500 310 L 500 810 L 345 810" fill="none" stroke="#e74c3c" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+<!-- Box: Speed outer loop -->
+<rect x="75" y="360" width="300" height="65" rx="10" ry="10" fill="#fce5cd" stroke="#d79b00" stroke-width="2"/>
+<text x="225" y="380" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="12" font-weight="bold" fill="#333">Speed Outer Loop (25 Hz)</text>
+<text x="225" y="396" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="11" fill="#333">Sync Read → Speed PI → θ_offset</text>
+<text x="225" y="412" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="10" fill="#666">(back-calc anti-windup, budget guard)</text>
+
+<!-- Arrow speed→effective_target -->
+<line x1="225" y1="425" x2="225" y2="460" stroke="#555" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+<!-- Box: effective_target -->
+<rect x="80" y="460" width="290" height="40" rx="10" ry="10" fill="#dae8fc" stroke="#6c8ebf" stroke-width="2"/>
+<text x="225" y="485" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="12" font-weight="bold" fill="#333">effective_target = target - θ_offset</text>
+
+<!-- Arrow effective_target→PID -->
+<line x1="225" y1="500" x2="225" y2="535" stroke="#555" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+<!-- Box: Inner PID/PD -->
+<rect x="75" y="535" width="300" height="65" rx="10" ry="10" fill="#d5e8d4" stroke="#82b366" stroke-width="2"/>
+<text x="225" y="555" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="12" font-weight="bold" fill="#333">Inner PID/PD</text>
+<text x="225" y="572" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="11" fill="#333">Speed: D = -rate (on-measurement)</text>
+<text x="225" y="589" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="11" fill="#333">Normal: D = LPF(dP/dt, α=0.2)</text>
+
+<!-- Arrow PID→RPM -->
+<line x1="225" y1="600" x2="225" y2="635" stroke="#555" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+<!-- Box: RPM calc -->
+<rect x="75" y="635" width="300" height="60" rx="10" ry="10" fill="#d5e8d4" stroke="#82b366" stroke-width="2"/>
+<text x="225" y="655" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="12" font-weight="bold" fill="#333">RPM Output</text>
+<text x="225" y="672" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="11" fill="#333">Speed: Kp·P + Kd·D</text>
+<text x="225" y="687" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="11" fill="#333">Normal: Kp·P + Ki·I + Kd·D  ±300</text>
+
+<!-- Arrow RPM→driveMotors -->
+<line x1="225" y1="695" x2="225" y2="730" stroke="#555" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+<!-- Box: driveMotors -->
+<rect x="105" y="730" width="240" height="45" rx="10" ry="10" fill="#d5e8d4" stroke="#82b366" stroke-width="2"/>
+<text x="225" y="750" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="12" font-weight="bold" fill="#333">driveMotors(rpm, rpm)</text>
+<text x="225" y="766" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="10" fill="#333">Sync Write Goal Velocity</text>
+
+<!-- Arrow driveMotors→Telemetry -->
+<line x1="225" y1="775" x2="225" y2="810" stroke="#555" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+<!-- Box: Telemetry -->
+<rect x="105" y="810" width="240" height="45" rx="10" ry="10" fill="#e1d5e7" stroke="#9673a6" stroke-width="2"/>
+<text x="225" y="830" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="12" font-weight="bold" fill="#333">Telemetry send (overwrite)</text>
+<text x="225" y="846" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="10" fill="#333">PID + speed fields</text>
+
+<!-- Arrow Telemetry→Wait -->
+<line x1="225" y1="855" x2="225" y2="890" stroke="#555" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+<!-- Box: Wait -->
+<rect x="105" y="890" width="240" height="40" rx="10" ry="10" fill="#f5f5f5" stroke="#666666" stroke-width="2"/>
+<text x="225" y="915" text-anchor="middle" font-family="Helvetica, sans-serif" font-size="12" font-weight="bold" fill="#333">vTaskDelayUntil (5ms)</text>
+
+<!-- Loop back arrow -->
+<path d="M 105 910 L 60 910 L 60 32 L 95 32" fill="none" stroke="#666" stroke-width="2" marker-end="url(#arrowhead)"/>
+    </g>
+</svg>
