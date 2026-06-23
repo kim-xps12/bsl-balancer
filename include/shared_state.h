@@ -17,10 +17,26 @@ struct CtrlCommand {
     float value;
 };
 
+enum class SafetyState : uint8_t {
+    DISARMED,
+    INITIALIZING,
+    ARMED_IDLE,
+    BALANCING,
+    FAULT,
+    SHUTDOWN,
+};
+
+struct MotorFeedback {
+    float current_A;
+    float velocity_rad_s;
+    float position_rad;
+    bool valid;
+};
+
 struct TelemetryData {
     float pitch_deg;
     float pitch_rate_dps;
-    float rpm_cmd;
+    float current_cmd_A;
     float P_term, I_term, D_term;
     uint32_t loop_us;
     bool fallen;
@@ -30,6 +46,11 @@ struct TelemetryData {
     float v_integral;
     uint32_t sync_read_us;
     bool speed_enabled;
+    SafetyState state;
+    float current_L_A;
+    float current_R_A;
+    float voltage_V;
+    uint8_t temp_C;
 };
 
 extern QueueHandle_t g_cmd_queue;
