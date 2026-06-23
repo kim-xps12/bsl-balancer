@@ -400,11 +400,10 @@ void controlLoopTask(void *pvParameters) {
             }
         }
 
-        // --- State transitions: ARMED_IDLE → BALANCING ---
+        // --- State transitions: ARMED_IDLE → BALANCING (immediate, pitch only) ---
         if (state == SafetyState::ARMED_IDLE) {
             float pitch_err = fabsf(target - pitch_filtered);
-            bool health_ready = (health_init_bitmap == 0x3F);
-            if (pitch_err < FALL_THRESHOLD_DEG && health_ready) {
+            if (pitch_err < FALL_THRESHOLD_DEG) {
                 state = SafetyState::BALANCING;
                 pid_active = false;
                 I_acc = 0.0f;
@@ -425,11 +424,26 @@ void controlLoopTask(void *pvParameters) {
             }
         }
 
-        // --- Fall detection (latches to FAULT, no auto-rearm) ---
+        // --- Fall detection (revert to ARMED_IDLE for auto-recovery) ---
         float fall_error = target - pitch_filtered;
         if (fall_error < -FALL_THRESHOLD_DEG || FALL_THRESHOLD_DEG < fall_error) {
-            enterFault("Fall detected");
-            state = SafetyState::FAULT;
+            driveMotorsZero();
+            I_acc = 0.0f;
+            preP = 0.0f;
+            D_filtered = 0.0f;
+            pid_active = false;
+            speed_enabled = false;
+            v_d = 0.0f;
+            yaw_rate_cmd = 0.0f;
+            theta_offset = 0.0f;
+            v_integral = 0.0f;
+            v_measured = 0.0f;
+            v_d_prev = 0.0f;
+            speed_divider_count = 0;
+            sync_read_fail_count = 0;
+            sync_read_skip_count = 0;
+            peak_accumulator_s = 0.0f;
+            state = SafetyState::ARMED_IDLE;
             TelemetryData tel = {};
             tel.pitch_deg = pitch_filtered;
             tel.pitch_rate_dps = imu.pitch_rate_dps;
@@ -579,7 +593,7 @@ void controlLoopTask(void *pvParameters) {
         // Continuous current limit (I²t-like tracking)
         float i_limit_now;
         if (!feedback_valid) {
-            i_limit_now = 0.0f;
+            i_limit_now = SW_CONT_CURRENT_LIMIT_A;
         } else if (peak_accumulator_s >= PEAK_DURATION_S) {
             i_limit_now = SW_CONT_CURRENT_LIMIT_A;
         } else {
