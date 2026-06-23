@@ -14,6 +14,12 @@ QueueHandle_t g_cmd_queue = nullptr;
 QueueHandle_t g_telemetry_queue = nullptr;
 SemaphoreHandle_t g_i2c_mutex = nullptr;
 
+static constexpr uint8_t DXL_IDS[] = {DXL_ID_L, DXL_ID_R};
+static const char* DXL_PING_FAIL_MESSAGES[] = {
+    "DXL L ping FAIL",
+    "DXL R ping FAIL",
+};
+
 // Task entry points (defined in control_task.cpp / ui_task.cpp)
 extern void controlLoopTask(void *pvParameters);
 extern void uiLoopTask(void *pvParameters);
@@ -47,14 +53,14 @@ void setup() {
     dxl = Dynamixel2Arduino(dxl_serial);
     dxl.begin(DXL_BAUDRATE);
     dxl.setPortProtocolVersion(DXL_PROTOCOL_VERSION);
-    if (!dxl.ping(DXL_ID_L)) { M5.Lcd.println("DXL L ping FAIL"); }
-    if (!dxl.ping(DXL_ID_R)) { M5.Lcd.println("DXL R ping FAIL"); }
-    dxl.torqueOff(DXL_ID_L);
-    dxl.torqueOff(DXL_ID_R);
-    dxl.setOperatingMode(DXL_ID_L, OP_VELOCITY);
-    dxl.setOperatingMode(DXL_ID_R, OP_VELOCITY);
-    dxl.torqueOn(DXL_ID_L);
-    dxl.torqueOn(DXL_ID_R);
+    for (uint8_t i = 0; i < 2; ++i) {
+        if (!dxl.ping(DXL_IDS[i])) {
+            M5.Lcd.println(DXL_PING_FAIL_MESSAGES[i]);
+        }
+    }
+    for (uint8_t id : DXL_IDS) dxl.torqueOff(id);
+    for (uint8_t id : DXL_IDS) dxl.setOperatingMode(id, OP_VELOCITY);
+    for (uint8_t id : DXL_IDS) dxl.torqueOn(id);
 
     // IMU
     imuDriver.begin(g_i2c_mutex);
