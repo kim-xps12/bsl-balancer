@@ -42,7 +42,7 @@ float pitch_target = 86.0f; // [deg] IMU reference angle for upright
 
 const float SOFTWARE_CURRENT_LIMIT_A = 0.35f;
 const float SPEED_HARD_RPM = 350.0f;
-const float D_LPF_TAU_S = 0.008f;
+const float D_LPF_TAU_S = 0.012f;
 const int SYNC_READ_DECIMATION = 2;
 
 // VEGA fuzzy controller artifact:
@@ -51,8 +51,8 @@ const int FUZZY_GRID_N = 11;
 const float WHEEL_RADIUS_M = 0.029f;
 const float RPM_TO_MPS = WHEEL_RADIUS_M * 2.0f * PI / 60.0f;
 const float POSITION_RAW_TO_RAD = 2.0f * PI / 4096.0f;
-const float FUZZY_THETA_ERR_MAX_RAD = 0.3f;
-const float FUZZY_THETA_RATE_MAX_RAD_S = 5.0f;
+const float FUZZY_THETA_ERR_MAX_RAD = 0.45f;
+const float FUZZY_THETA_RATE_MAX_RAD_S = 4.0f;
 const float FUZZY_VEL_ERR_MAX_MPS = 0.4f;
 const float FUZZY_VEL_INT_MAX_M = 0.4f;
 const float FUZZY_THETA_REF_MAX_RAD = 0.10f;
@@ -64,7 +64,7 @@ const float PSI_ERR_MAX_RAD_S = 2.0f;
 const float YAW_RATE_SIGN = 1.0f;
 const float VELOCITY_CMD_LIMIT_MPS = 0.04f;
 
-const float STATION_HOLD_GAIN = 0.8f;
+const float STATION_HOLD_GAIN = 0.0f;
 const float STATION_HOLD_DEADBAND_MPS = 0.005f;
 const float STATION_HOLD_SETTLE_MPS = 0.02f;
 const float STATION_HOLD_DWELL_S = 0.3f;
@@ -105,7 +105,7 @@ const float T_PSI[FUZZY_GRID_N] = {
 // Fuzzy controller state
 float theta_dot_lpf = 0.0f;
 float fuzzy_vel_integral = 0.0f;
-float fuzzy_current_scale = 1.0f;
+float fuzzy_current_scale = 0.75f;
 float velocity_cmd_mps = 0.0f;
 
 // Sync Read: Present Velocity + Present Position (addr 128, 8 bytes) x2 motors
@@ -233,6 +233,13 @@ void resetFuzzyState() {
 
 
 float stationHoldTrim(float velocity_cmd, float x, float v, float dt) {
+  if (STATION_HOLD_GAIN <= 0.0f) {
+    station_hold_has_x = false;
+    station_hold_dwell_s = 0.0f;
+    telem_hold_state = 0;
+    return 0.0f;
+  }
+
   if (!odom_initialized) {
     station_hold_has_x = false;
     station_hold_dwell_s = 0.0f;
@@ -605,6 +612,9 @@ void setup(){
   DEBUG_SERIAL.println("# Artifact: tables/vega_best_mujoco_teleop_200hz_stationhold.npz");
   DEBUG_SERIAL.printf("# ctrl_limit=%f, ctrl_to_current_A=%f, current_limit_A=%f\n",
       FUZZY_CTRL_LIMIT, FUZZY_CTRL_TO_CURRENT_A, SOFTWARE_CURRENT_LIMIT_A);
+  DEBUG_SERIAL.printf("# real_tune: current_scale=%f, theta_err_max=%f, theta_rate_max=%f, d_lpf_tau=%f, station_hold_gain=%f\n",
+      fuzzy_current_scale, FUZZY_THETA_ERR_MAX_RAD, FUZZY_THETA_RATE_MAX_RAD_S,
+      D_LPF_TAU_S, STATION_HOLD_GAIN);
   DEBUG_SERIAL.println("T,t_ms,dt_us,pitch,theta,theta_ref,theta_trim,theta_dot,v_mps,v_cmd,vel_int,odom_x,ctrl_base,ctrl_yaw,ctrl_L,yaw_rate,current_L,current_R,vel_L_rpm,vel_R_rpm,hold_state");
   
   // RTOS Task Settings
