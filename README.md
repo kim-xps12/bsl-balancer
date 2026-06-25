@@ -44,17 +44,15 @@ It has a friendly design with a face created by [m5stack-avatar](https://github.
 
 ## Environment
 - PlatformIO on Visual Studio Code
-- ~~Arduino IDE on Windows 11 (please apply M5Stack setting)~~
+- DYNAMIXEL XL330 Current Control Mode
 
 **NOTE**
 
-このリポジトリではArduino IDEのサポートのサポートを終了しました．
-`for_arduino_ide`に以前までのコードを保存しているので，サンプルとしての利用は可能です．
-Arduino IDEで開発される場合は，これをベースにPIO向けのコードの内容を手動で反映させることでお使いいただけます．
+このリポジトリは PlatformIO 専用です．
+DYNAMIXEL XL330 は Current Control Mode で扱い，ファームウェアは電流指令を出力します．
 
-This repository no longer supports Arduino IDE.
-The previous code is saved in `for_arduino_ide`, so it can be used as a example.
-If you are developing with Arduino IDE, you can use this as a base by manually reflecting the contents of the code in PIO code.
+This repository is PlatformIO-only.
+DYNAMIXEL XL330 is driven in Current Control Mode, and the firmware outputs current commands.
 
 ## Parts 3D-Print and Assembly
 - please refer **fron** and **back** view.
@@ -155,4 +153,3 @@ The configured parameters will be lost upon reset, such as when the power is cyc
 - M5Unified: [https://github.com/m5stack/M5Unified](https://github.com/m5stack/M5Unified)
 
 - TKJElectronics KalmanFilter Library: [https://github.com/TKJElectronics/KalmanFilter](https://github.com/TKJElectronics/KalmanFilter)
-
