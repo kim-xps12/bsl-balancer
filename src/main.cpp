@@ -82,6 +82,8 @@ const float STATION_HOLD_DWELL_S = 0.3f;
 const uint32_t PS4_REPORT_PERIOD_MS = 250;
 const uint32_t PS4_STATUS_DRAW_PERIOD_MS = 500;
 const int PS4_LY_DEADBAND = 8;
+const int DXL_PING_RETRIES = 3;
+const uint32_t DXL_PING_RETRY_DELAY_MS = 50;
 
 const float T_THETA[FUZZY_GRID_N][FUZZY_GRID_N] = {
   {-42.91900f, -37.72867f, -37.02978f, -42.68309f, -38.84818f, -44.06319f, -11.98498f, -1.037281f, 2.478805f, -10.20923f, -4.862647f},
@@ -333,6 +335,31 @@ void updatePS4VelocityCommand() {
   ps4_ly = constrain((int)PS4.LStickY(), -127, 127);
   ps4_velocity_cmd_mps = velocityCommandFromPS4Ly(ps4_ly);
   velocity_cmd_mps = ps4_velocity_cmd_mps;
+}
+
+
+bool pingDynamixels() {
+  bool ping_L = false;
+  bool ping_R = false;
+
+  for (int i = 0; i < DXL_PING_RETRIES; ++i) {
+    ping_L = dxl.ping(DXL_ID_L);
+    ping_R = dxl.ping(DXL_ID_R);
+
+    DEBUG_PRINT("ping try ");
+    DEBUG_PRINT(i + 1);
+    DEBUG_PRINT(" L: ");
+    DEBUG_PRINT(ping_L);
+    DEBUG_PRINT(", R: ");
+    DEBUG_PRINTLN(ping_R);
+
+    if (ping_L && ping_R) {
+      return true;
+    }
+    delay(DXL_PING_RETRY_DELAY_MS);
+  }
+
+  return false;
 }
 
 
@@ -741,12 +768,7 @@ void setup(){
 
   dxl.setPortProtocolVersion(DXL_PROTOCOL_VERSION);
 
-  DEBUG_PRINT("ping L: ");
-  DEBUG_PRINT(dxl.ping(DXL_ID_L));
-  DEBUG_PRINT(", ping R: ");
-  DEBUG_PRINTLN(dxl.ping(DXL_ID_R));
-
-  if (!dxl.ping(DXL_ID_L) || !dxl.ping(DXL_ID_R)) {
+  if (!pingDynamixels()) {
     DEBUG_SERIAL.println("DYNAMIXEL ping failed!");
     M5.Lcd.println("DYNAMIXEL ping failed!");
     while (true) {
