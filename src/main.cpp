@@ -732,9 +732,6 @@ void setup(){
   avatar.setFace(tairinFace);
   avatar.init();
 
-  // PS4 controller host setup
-  setupPS4Controller();
-
   // DYNAMIXEL Settings
   DXL_SERIAL.begin(BAUD_DXL, SERIAL_8N1, PIN_RX_SERVO, PIN_TX_SERVO);
   dxl = Dynamixel2Arduino(DXL_SERIAL);
@@ -807,6 +804,9 @@ void setup(){
 
   // Kalman filter Setting
   kalman.setAngle(getPitch());
+
+  // PS4 controller host setup
+  setupPS4Controller();
 
   DEBUG_PRINTLN("# Controller: VEGA fuzzy grid");
   DEBUG_PRINTLN("# Artifact: tables/vega_best_mujoco_teleop_200hz_stationhold.npz");
