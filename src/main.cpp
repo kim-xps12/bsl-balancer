@@ -1,5 +1,6 @@
 #include <Arduino.h>
 
+#include <esp_system.h>
 #include <M5Unified.h>
 #include <Avatar.h>
 
@@ -9,6 +10,7 @@
 #include <Kalman.h>
 #include <Preferences.h>
 #include <Dynamixel2Arduino.h>
+#include <PS4Controller.h>
 
 HardwareSerial& DXL_SERIAL = Serial1;
 #define DEBUG_SERIAL Serial
@@ -68,6 +70,8 @@ const float STATION_HOLD_GAIN = 0.0f;
 const float STATION_HOLD_DEADBAND_MPS = 0.005f;
 const float STATION_HOLD_SETTLE_MPS = 0.02f;
 const float STATION_HOLD_DWELL_S = 0.3f;
+const uint32_t PS4_REPORT_PERIOD_MS = 250;
+const uint32_t PS4_STATUS_DRAW_PERIOD_MS = 500;
 
 const float T_THETA[FUZZY_GRID_N][FUZZY_GRID_N] = {
   {-42.91900f, -37.72867f, -37.02978f, -42.68309f, -38.84818f, -44.06319f, -11.98498f, -1.037281f, 2.478805f, -10.20923f, -4.862647f},
@@ -107,6 +111,14 @@ float theta_dot_lpf = 0.0f;
 float fuzzy_vel_integral = 0.0f;
 float fuzzy_current_scale = 0.75f;
 float velocity_cmd_mps = 0.0f;
+
+volatile bool ps4_connect_event = false;
+volatile bool ps4_disconnect_event = false;
+bool ps4_enabled = false;
+bool ps4_connected = false;
+bool ps4_status_dirty = true;
+unsigned long ps4_last_report_ms = 0;
+unsigned long ps4_last_status_draw_ms = 0;
 
 // Sync Read: Present Velocity + Present Position (addr 128, 8 bytes) x2 motors
 const uint16_t ADDR_PRESENT_VELOCITY = 128;
@@ -229,6 +241,108 @@ void resetFuzzyState() {
   telem_ctrl_R = 0.0f;
   telem_yaw_rate = 0.0f;
   telem_hold_state = 0;
+}
+
+
+void handlePS4Connect() {
+  ps4_connect_event = true;
+}
+
+
+void handlePS4Disconnect() {
+  ps4_disconnect_event = true;
+}
+
+
+uint16_t ps4ButtonMask() {
+  uint16_t mask = 0;
+  if (PS4.Up()) mask |= 1 << 0;
+  if (PS4.Down()) mask |= 1 << 1;
+  if (PS4.Left()) mask |= 1 << 2;
+  if (PS4.Right()) mask |= 1 << 3;
+  if (PS4.Square()) mask |= 1 << 4;
+  if (PS4.Cross()) mask |= 1 << 5;
+  if (PS4.Circle()) mask |= 1 << 6;
+  if (PS4.Triangle()) mask |= 1 << 7;
+  if (PS4.L1()) mask |= 1 << 8;
+  if (PS4.R1()) mask |= 1 << 9;
+  if (PS4.Share()) mask |= 1 << 10;
+  if (PS4.Options()) mask |= 1 << 11;
+  if (PS4.L3()) mask |= 1 << 12;
+  if (PS4.R3()) mask |= 1 << 13;
+  if (PS4.PSButton()) mask |= 1 << 14;
+  if (PS4.Touchpad()) mask |= 1 << 15;
+  return mask;
+}
+
+
+void setupPS4Controller() {
+  uint8_t bt_mac[6];
+  esp_read_mac(bt_mac, ESP_MAC_BT);
+  DEBUG_SERIAL.printf("Bluetooth Mac Address => %02X:%02X:%02X:%02X:%02X:%02X\n",
+      bt_mac[0], bt_mac[1], bt_mac[2], bt_mac[3], bt_mac[4], bt_mac[5]);
+
+  PS4.attachOnConnect(handlePS4Connect);
+  PS4.attachOnDisconnect(handlePS4Disconnect);
+  ps4_enabled = PS4.begin();
+
+  if (ps4_enabled) {
+    DEBUG_SERIAL.println("PS4 controller host ready.");
+    DEBUG_SERIAL.println("Please pair the gamepad to the Bluetooth MAC above and press HOME.");
+  } else {
+    DEBUG_SERIAL.println("PS4 controller host init failed.");
+  }
+}
+
+
+void pollPS4Controller() {
+  if (!ps4_enabled) {
+    return;
+  }
+
+  if (ps4_connect_event) {
+    ps4_connect_event = false;
+    ps4_connected = true;
+    ps4_status_dirty = true;
+    DEBUG_SERIAL.println("PS4 controller connected");
+    PS4.setLed(0, 32, 64);
+    PS4.sendToController();
+  }
+
+  if (ps4_disconnect_event) {
+    ps4_disconnect_event = false;
+    ps4_connected = false;
+    ps4_status_dirty = true;
+    DEBUG_SERIAL.println("PS4 controller disconnected");
+  }
+
+  bool connected_now = PS4.isConnected();
+  if (connected_now != ps4_connected) {
+    ps4_connected = connected_now;
+    ps4_status_dirty = true;
+    DEBUG_SERIAL.println(ps4_connected ? "PS4 controller connected" : "PS4 controller disconnected");
+  }
+
+  if (!ps4_connected) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - ps4_last_report_ms < PS4_REPORT_PERIOD_MS) {
+    return;
+  }
+  ps4_last_report_ms = now;
+
+  DEBUG_SERIAL.printf(
+      "PS4,bat=%u,lx=%d,ly=%d,rx=%d,ry=%d,l2=%u,r2=%u,buttons=0x%04X\n",
+      PS4.Battery(),
+      PS4.LStickX(),
+      PS4.LStickY(),
+      PS4.RStickX(),
+      PS4.RStickY(),
+      PS4.L2Value(),
+      PS4.R2Value(),
+      ps4ButtonMask());
 }
 
 
@@ -438,11 +552,28 @@ void drawButton(const char* label, int x, int y, float value) {
 }
 
 
+void drawPS4Status() {
+  M5.Display.fillRect(20, 150, 290, 24, BLACK);
+  M5.Display.setCursor(20, 150);
+
+  if (!ps4_enabled) {
+    M5.Display.print("PS4: init failed");
+  } else if (ps4_connected) {
+    M5.Display.printf("PS4: connected Bat:%u", PS4.Battery());
+  } else {
+    M5.Display.print("PS4: waiting HOME");
+  }
+}
+
+
 void drawCtrlPanel(){
   drawButton("Ref", 20, 30, pitch_target);
   drawButton("Scale", 20, 70, fuzzy_current_scale);
   drawButton("Vcmd", 20, 110, velocity_cmd_mps);
 
+  drawPS4Status();
+
+  M5.Display.fillRect(20, 190, 290, 24, BLACK);
   M5.Display.setCursor(20, 190);
   int batteryPercentage = M5.Power.getBatteryLevel();
   M5.Display.printf("M5Core2 Battery: %d%%", batteryPercentage);
@@ -489,6 +620,7 @@ void uiLoopTask(void *pvParameters){
   TickType_t xLastWakeTime = xTaskGetTickCount();  
   while(true){
     M5.update();
+    pollPS4Controller();
 
     //draw avatar face
     if (M5.BtnA.wasPressed()) {
@@ -510,6 +642,13 @@ void uiLoopTask(void *pvParameters){
     }
     
     if (enShowCtrlPanel) {
+      unsigned long now = millis();
+      if (ps4_status_dirty || now - ps4_last_status_draw_ms >= PS4_STATUS_DRAW_PERIOD_MS) {
+        drawPS4Status();
+        ps4_status_dirty = false;
+        ps4_last_status_draw_ms = now;
+      }
+
       bool isReleased = true;
         if (M5.Touch.getCount()>0 && isReleased) {
           isReleased = false;
@@ -538,6 +677,9 @@ void setup(){
   tairinFace = createTairinFace();
   avatar.setFace(tairinFace);
   avatar.init();
+
+  // PS4 controller host setup
+  setupPS4Controller();
 
   // DYNAMIXEL Settings
   DXL_SERIAL.begin(BAUD_DXL, SERIAL_8N1, PIN_RX_SERVO, PIN_TX_SERVO);
