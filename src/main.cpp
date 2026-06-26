@@ -735,12 +735,6 @@ void setup(){
   // PS4 controller host setup
   setupPS4Controller();
 
-  // Keep PS4 status observable even if the later DYNAMIXEL setup faults.
-  const uint32_t MEMORY_STACK = 8192;
-  const UBaseType_t PRIORIRY_UI = 2;
-  const BaseType_t CORE_UI = 0;
-  xTaskCreatePinnedToCore(uiLoopTask,      "UI Loop Task",      MEMORY_STACK, NULL, PRIORIRY_UI,   NULL, CORE_UI);
-
   // DYNAMIXEL Settings
   DXL_SERIAL.begin(BAUD_DXL, SERIAL_8N1, PIN_RX_SERVO, PIN_TX_SERVO);
   dxl = Dynamixel2Arduino(DXL_SERIAL);
@@ -758,7 +752,10 @@ void setup(){
   if (!dxl.ping(DXL_ID_L) || !dxl.ping(DXL_ID_R)) {
     DEBUG_SERIAL.println("DYNAMIXEL ping failed!");
     M5.Lcd.println("DYNAMIXEL ping failed!");
-    while (true) delay(1000);
+    while (true) {
+      pollPS4Controller();
+      delay(25);
+    }
   }
 
   DEBUG_PRINTLN("DYNAMIXEL ping OK");
@@ -821,9 +818,14 @@ void setup(){
   DEBUG_PRINTLN("T,t_ms,dt_us,pitch,theta,theta_ref,theta_trim,theta_dot,v_mps,v_cmd,vel_int,odom_x,ctrl_base,ctrl_yaw,ctrl_L,yaw_rate,current_L,current_R,vel_L_rpm,vel_R_rpm,hold_state");
   
   // RTOS Task Settings
+  const uint32_t MEMORY_STACK = 8192;
   const UBaseType_t PRIORIRY_CTRL = 5;
   const BaseType_t CORE_CTRL = 1;
   xTaskCreatePinnedToCore(controlLoopTask, "Control Loop Task", MEMORY_STACK, NULL, PRIORIRY_CTRL, NULL, CORE_CTRL);
+
+  const UBaseType_t PRIORIRY_UI = 2;
+  const BaseType_t CORE_UI = 0;
+  xTaskCreatePinnedToCore(uiLoopTask,      "UI Loop Task",      MEMORY_STACK, NULL, PRIORIRY_UI,   NULL, CORE_UI);
 }
 
 
