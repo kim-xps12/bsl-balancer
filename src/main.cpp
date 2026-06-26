@@ -72,6 +72,7 @@ const float STATION_HOLD_SETTLE_MPS = 0.02f;
 const float STATION_HOLD_DWELL_S = 0.3f;
 const uint32_t PS4_REPORT_PERIOD_MS = 250;
 const uint32_t PS4_STATUS_DRAW_PERIOD_MS = 500;
+const int PS4_LY_DEADBAND = 8;
 
 const float T_THETA[FUZZY_GRID_N][FUZZY_GRID_N] = {
   {-42.91900f, -37.72867f, -37.02978f, -42.68309f, -38.84818f, -44.06319f, -11.98498f, -1.037281f, 2.478805f, -10.20923f, -4.862647f},
@@ -119,6 +120,8 @@ bool ps4_connected = false;
 bool ps4_status_dirty = true;
 unsigned long ps4_last_report_ms = 0;
 unsigned long ps4_last_status_draw_ms = 0;
+int ps4_ly = 0;
+float ps4_velocity_cmd_mps = 0.0f;
 
 // Sync Read: Present Velocity + Present Position (addr 128, 8 bytes) x2 motors
 const uint16_t ADDR_PRESENT_VELOCITY = 128;
@@ -295,6 +298,35 @@ void setupPS4Controller() {
 }
 
 
+float velocityCommandFromPS4Ly(int ly) {
+  ly = constrain(ly, -127, 127);
+
+  int abs_ly = ly >= 0 ? ly : -ly;
+  if (abs_ly <= PS4_LY_DEADBAND) {
+    return 0.0f;
+  }
+
+  float magnitude = (float)(abs_ly - PS4_LY_DEADBAND) / (float)(127 - PS4_LY_DEADBAND);
+  float sign = ly >= 0 ? 1.0f : -1.0f;
+  return sign * magnitude * VELOCITY_CMD_LIMIT_MPS;
+}
+
+
+void clearPS4VelocityCommand() {
+  ps4_ly = 0;
+  ps4_velocity_cmd_mps = 0.0f;
+  velocity_cmd_mps = 0.0f;
+  ps4_status_dirty = true;
+}
+
+
+void updatePS4VelocityCommand() {
+  ps4_ly = constrain((int)PS4.LStickY(), -127, 127);
+  ps4_velocity_cmd_mps = velocityCommandFromPS4Ly(ps4_ly);
+  velocity_cmd_mps = ps4_velocity_cmd_mps;
+}
+
+
 void pollPS4Controller() {
   if (!ps4_enabled) {
     return;
@@ -304,6 +336,7 @@ void pollPS4Controller() {
     ps4_connect_event = false;
     ps4_connected = true;
     ps4_status_dirty = true;
+    clearPS4VelocityCommand();
     DEBUG_SERIAL.println("PS4 controller connected");
     PS4.setLed(0, 32, 64);
     PS4.sendToController();
@@ -312,7 +345,7 @@ void pollPS4Controller() {
   if (ps4_disconnect_event) {
     ps4_disconnect_event = false;
     ps4_connected = false;
-    ps4_status_dirty = true;
+    clearPS4VelocityCommand();
     DEBUG_SERIAL.println("PS4 controller disconnected");
   }
 
@@ -320,12 +353,17 @@ void pollPS4Controller() {
   if (connected_now != ps4_connected) {
     ps4_connected = connected_now;
     ps4_status_dirty = true;
+    if (!ps4_connected) {
+      clearPS4VelocityCommand();
+    }
     DEBUG_SERIAL.println(ps4_connected ? "PS4 controller connected" : "PS4 controller disconnected");
   }
 
   if (!ps4_connected) {
     return;
   }
+
+  updatePS4VelocityCommand();
 
   unsigned long now = millis();
   if (now - ps4_last_report_ms < PS4_REPORT_PERIOD_MS) {
@@ -334,10 +372,11 @@ void pollPS4Controller() {
   ps4_last_report_ms = now;
 
   DEBUG_SERIAL.printf(
-      "PS4,bat=%u,lx=%d,ly=%d,rx=%d,ry=%d,l2=%u,r2=%u,buttons=0x%04X\n",
+      "PS4,bat=%u,lx=%d,ly=%d,vcmd=%.4f,rx=%d,ry=%d,l2=%u,r2=%u,buttons=0x%04X\n",
       PS4.Battery(),
       PS4.LStickX(),
-      PS4.LStickY(),
+      ps4_ly,
+      ps4_velocity_cmd_mps,
       PS4.RStickX(),
       PS4.RStickY(),
       PS4.L2Value(),
@@ -559,7 +598,7 @@ void drawPS4Status() {
   if (!ps4_enabled) {
     M5.Display.print("PS4: init failed");
   } else if (ps4_connected) {
-    M5.Display.printf("PS4: connected Bat:%u", PS4.Battery());
+    M5.Display.printf("PS4: Bat:%u LY:%d", PS4.Battery(), ps4_ly);
   } else {
     M5.Display.print("PS4: waiting HOME");
   }
@@ -645,6 +684,9 @@ void uiLoopTask(void *pvParameters){
       unsigned long now = millis();
       if (ps4_status_dirty || now - ps4_last_status_draw_ms >= PS4_STATUS_DRAW_PERIOD_MS) {
         drawPS4Status();
+        if (ps4_connected) {
+          drawButton("Vcmd", 20, 110, velocity_cmd_mps);
+        }
         ps4_status_dirty = false;
         ps4_last_status_draw_ms = now;
       }
