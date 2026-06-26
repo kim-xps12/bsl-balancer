@@ -15,6 +15,15 @@
 HardwareSerial& DXL_SERIAL = Serial1;
 #define DEBUG_SERIAL Serial
 //#define ENABLE_DEBUG_PRINT
+#ifdef ENABLE_DEBUG_PRINT
+#define DEBUG_PRINT(...) DEBUG_SERIAL.print(__VA_ARGS__)
+#define DEBUG_PRINTLN(...) DEBUG_SERIAL.println(__VA_ARGS__)
+#define DEBUG_PRINTF(...) DEBUG_SERIAL.printf(__VA_ARGS__)
+#else
+#define DEBUG_PRINT(...)
+#define DEBUG_PRINTLN(...)
+#define DEBUG_PRINTF(...)
+#endif
 
 
 using namespace m5avatar;
@@ -371,17 +380,20 @@ void pollPS4Controller() {
   }
   ps4_last_report_ms = now;
 
-  DEBUG_SERIAL.printf(
-      "PS4,bat=%u,lx=%d,ly=%d,vcmd=%.4f,rx=%d,ry=%d,l2=%u,r2=%u,buttons=0x%04X\n",
-      PS4.Battery(),
-      PS4.LStickX(),
-      ps4_ly,
-      ps4_velocity_cmd_mps,
-      PS4.RStickX(),
-      PS4.RStickY(),
-      PS4.L2Value(),
-      PS4.R2Value(),
-      ps4ButtonMask());
+  DEBUG_SERIAL.printf("PS4,vcmd=%.4f\n", ps4_velocity_cmd_mps);
+
+  // Raw PS4 input dump. Re-enable when diagnosing controller packets.
+  // DEBUG_PRINTF(
+  //     "PS4,bat=%u,lx=%d,ly=%d,vcmd=%.4f,rx=%d,ry=%d,l2=%u,r2=%u,buttons=0x%04X\n",
+  //     PS4.Battery(),
+  //     PS4.LStickX(),
+  //     ps4_ly,
+  //     ps4_velocity_cmd_mps,
+  //     PS4.RStickX(),
+  //     PS4.RStickY(),
+  //     PS4.L2Value(),
+  //     PS4.R2Value(),
+  //     ps4ButtonMask());
 }
 
 
@@ -564,7 +576,7 @@ void calcFuzzy(){
 
   if (++telem_counter >= TELEM_DECIMATION) {
     telem_counter = 0;
-    DEBUG_SERIAL.printf("T,%lu,%.0f,%.2f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.1f,%.1f,%d\n",
+    DEBUG_PRINTF("T,%lu,%.0f,%.2f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.1f,%.1f,%d\n",
         millis(), dt * 1000000.0f, pitch_kalman,
         theta, theta_ref, telem_theta_ref_trim, theta_dot_lpf,
         telem_v_fwd, v_cmd, fuzzy_vel_integral, telem_odom_x,
@@ -723,26 +735,33 @@ void setup(){
   // PS4 controller host setup
   setupPS4Controller();
 
+  // Keep PS4 status observable even if the later DYNAMIXEL setup faults.
+  const uint32_t MEMORY_STACK = 8192;
+  const UBaseType_t PRIORIRY_UI = 2;
+  const BaseType_t CORE_UI = 0;
+  xTaskCreatePinnedToCore(uiLoopTask,      "UI Loop Task",      MEMORY_STACK, NULL, PRIORIRY_UI,   NULL, CORE_UI);
+
   // DYNAMIXEL Settings
   DXL_SERIAL.begin(BAUD_DXL, SERIAL_8N1, PIN_RX_SERVO, PIN_TX_SERVO);
   dxl = Dynamixel2Arduino(DXL_SERIAL);
   dxl.begin(BAUD_DXL);
 
-  DEBUG_SERIAL.println("DYNAMIXEL ping Waiting...");
+  DEBUG_PRINTLN("DYNAMIXEL ping Waiting...");
 
   dxl.setPortProtocolVersion(DXL_PROTOCOL_VERSION);
 
-  DEBUG_SERIAL.print("ping L: ");
-  DEBUG_SERIAL.print(dxl.ping(DXL_ID_L));
-  DEBUG_SERIAL.print(", ping R: ");
-  DEBUG_SERIAL.println(dxl.ping(DXL_ID_R));
+  DEBUG_PRINT("ping L: ");
+  DEBUG_PRINT(dxl.ping(DXL_ID_L));
+  DEBUG_PRINT(", ping R: ");
+  DEBUG_PRINTLN(dxl.ping(DXL_ID_R));
 
   if (!dxl.ping(DXL_ID_L) || !dxl.ping(DXL_ID_R)) {
+    DEBUG_SERIAL.println("DYNAMIXEL ping failed!");
     M5.Lcd.println("DYNAMIXEL ping failed!");
     while (true) delay(1000);
   }
 
-  DEBUG_SERIAL.println("DYNAMIXEL ping OK");
+  DEBUG_PRINTLN("DYNAMIXEL ping OK");
 
   dxl.torqueOff(DXL_ID_L);
   dxl.torqueOff(DXL_ID_R);
@@ -792,24 +811,19 @@ void setup(){
   // Kalman filter Setting
   kalman.setAngle(getPitch());
 
-  DEBUG_SERIAL.println("# Controller: VEGA fuzzy grid");
-  DEBUG_SERIAL.println("# Artifact: tables/vega_best_mujoco_teleop_200hz_stationhold.npz");
-  DEBUG_SERIAL.printf("# ctrl_limit=%f, ctrl_to_current_A=%f, current_limit_A=%f\n",
+  DEBUG_PRINTLN("# Controller: VEGA fuzzy grid");
+  DEBUG_PRINTLN("# Artifact: tables/vega_best_mujoco_teleop_200hz_stationhold.npz");
+  DEBUG_PRINTF("# ctrl_limit=%f, ctrl_to_current_A=%f, current_limit_A=%f\n",
       FUZZY_CTRL_LIMIT, FUZZY_CTRL_TO_CURRENT_A, SOFTWARE_CURRENT_LIMIT_A);
-  DEBUG_SERIAL.printf("# real_tune: current_scale=%f, theta_err_max=%f, theta_rate_max=%f, d_lpf_tau=%f, station_hold_gain=%f\n",
+  DEBUG_PRINTF("# real_tune: current_scale=%f, theta_err_max=%f, theta_rate_max=%f, d_lpf_tau=%f, station_hold_gain=%f\n",
       fuzzy_current_scale, FUZZY_THETA_ERR_MAX_RAD, FUZZY_THETA_RATE_MAX_RAD_S,
       D_LPF_TAU_S, STATION_HOLD_GAIN);
-  DEBUG_SERIAL.println("T,t_ms,dt_us,pitch,theta,theta_ref,theta_trim,theta_dot,v_mps,v_cmd,vel_int,odom_x,ctrl_base,ctrl_yaw,ctrl_L,yaw_rate,current_L,current_R,vel_L_rpm,vel_R_rpm,hold_state");
+  DEBUG_PRINTLN("T,t_ms,dt_us,pitch,theta,theta_ref,theta_trim,theta_dot,v_mps,v_cmd,vel_int,odom_x,ctrl_base,ctrl_yaw,ctrl_L,yaw_rate,current_L,current_R,vel_L_rpm,vel_R_rpm,hold_state");
   
   // RTOS Task Settings
-  const uint32_t MEMORY_STACK = 8192;
   const UBaseType_t PRIORIRY_CTRL = 5;
   const BaseType_t CORE_CTRL = 1;
   xTaskCreatePinnedToCore(controlLoopTask, "Control Loop Task", MEMORY_STACK, NULL, PRIORIRY_CTRL, NULL, CORE_CTRL);
-
-  const UBaseType_t PRIORIRY_UI = 2;
-  const BaseType_t CORE_UI = 0;
-  xTaskCreatePinnedToCore(uiLoopTask,      "UI Loop Task",      MEMORY_STACK, NULL, PRIORIRY_UI,   NULL, CORE_UI);
 }
 
 
