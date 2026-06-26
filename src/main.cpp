@@ -1,5 +1,6 @@
 #include <Arduino.h>
 
+#include <esp_system.h>
 #include <M5Unified.h>
 #include <Avatar.h>
 
@@ -9,10 +10,20 @@
 #include <Kalman.h>
 #include <Preferences.h>
 #include <Dynamixel2Arduino.h>
+#include <PS4Controller.h>
 
 HardwareSerial& DXL_SERIAL = Serial1;
 #define DEBUG_SERIAL Serial
 //#define ENABLE_DEBUG_PRINT
+#ifdef ENABLE_DEBUG_PRINT
+#define DEBUG_PRINT(...) DEBUG_SERIAL.print(__VA_ARGS__)
+#define DEBUG_PRINTLN(...) DEBUG_SERIAL.println(__VA_ARGS__)
+#define DEBUG_PRINTF(...) DEBUG_SERIAL.printf(__VA_ARGS__)
+#else
+#define DEBUG_PRINT(...)
+#define DEBUG_PRINTLN(...)
+#define DEBUG_PRINTF(...)
+#endif
 
 
 using namespace m5avatar;
@@ -62,12 +73,20 @@ const float FUZZY_CTRL_LIMIT = FUZZY_FORCE_LIMIT_NM / FUZZY_MOTOR_GEAR;
 const float FUZZY_CTRL_TO_CURRENT_A = SOFTWARE_CURRENT_LIMIT_A / FUZZY_CTRL_LIMIT;
 const float PSI_ERR_MAX_RAD_S = 2.0f;
 const float YAW_RATE_SIGN = 1.0f;
-const float VELOCITY_CMD_LIMIT_MPS = 0.04f;
+const float VELOCITY_CMD_LIMIT_MPS = 0.08f;
 
 const float STATION_HOLD_GAIN = 0.0f;
 const float STATION_HOLD_DEADBAND_MPS = 0.005f;
 const float STATION_HOLD_SETTLE_MPS = 0.02f;
 const float STATION_HOLD_DWELL_S = 0.3f;
+const uint32_t PS4_REPORT_PERIOD_MS = 250;
+const uint32_t PS4_STATUS_DRAW_PERIOD_MS = 500;
+const int PS4_LY_DEADBAND = 8;
+const int DXL_PING_RETRIES = 3;
+const uint32_t DXL_PING_RETRY_DELAY_MS = 50;
+const int VEL_DEBUG_DECIMATION = 40;
+const float VELOCITY_INTEGRAL_CMD_DEADBAND_MPS = 0.005f;
+const float VELOCITY_NEUTRAL_SPEED_DEADBAND_MPS = 0.005f;
 
 const float T_THETA[FUZZY_GRID_N][FUZZY_GRID_N] = {
   {-42.91900f, -37.72867f, -37.02978f, -42.68309f, -38.84818f, -44.06319f, -11.98498f, -1.037281f, 2.478805f, -10.20923f, -4.862647f},
@@ -105,8 +124,19 @@ const float T_PSI[FUZZY_GRID_N] = {
 // Fuzzy controller state
 float theta_dot_lpf = 0.0f;
 float fuzzy_vel_integral = 0.0f;
+float previous_v_cmd_mps = 0.0f;
 float fuzzy_current_scale = 0.75f;
 float velocity_cmd_mps = 0.0f;
+
+volatile bool ps4_connect_event = false;
+volatile bool ps4_disconnect_event = false;
+bool ps4_enabled = false;
+bool ps4_connected = false;
+bool ps4_status_dirty = true;
+unsigned long ps4_last_report_ms = 0;
+unsigned long ps4_last_status_draw_ms = 0;
+int ps4_ly = 0;
+float ps4_velocity_cmd_mps = 0.0f;
 
 // Sync Read: Present Velocity + Present Position (addr 128, 8 bytes) x2 motors
 const uint16_t ADDR_PRESENT_VELOCITY = 128;
@@ -128,6 +158,7 @@ DYNAMIXEL::InfoSyncWriteInst_t sw_info;
 // Telemetry (20Hz output)
 const int TELEM_DECIMATION = 10;
 int telem_counter = 0;
+int vel_debug_counter = 0;
 float telem_vel_L = 0.0f;
 float telem_vel_R = 0.0f;
 float telem_v_fwd = 0.0f;
@@ -219,6 +250,7 @@ float interp1D(const float table[FUZZY_GRID_N], float x, float x_max) {
 void resetFuzzyState() {
   theta_dot_lpf = 0.0f;
   fuzzy_vel_integral = 0.0f;
+  previous_v_cmd_mps = 0.0f;
   station_hold_has_x = false;
   station_hold_dwell_s = 0.0f;
   telem_theta_ref = 0.0f;
@@ -229,6 +261,172 @@ void resetFuzzyState() {
   telem_ctrl_R = 0.0f;
   telem_yaw_rate = 0.0f;
   telem_hold_state = 0;
+}
+
+
+void handlePS4Connect() {
+  ps4_connect_event = true;
+}
+
+
+void handlePS4Disconnect() {
+  ps4_disconnect_event = true;
+}
+
+
+uint16_t ps4ButtonMask() {
+  uint16_t mask = 0;
+  if (PS4.Up()) mask |= 1 << 0;
+  if (PS4.Down()) mask |= 1 << 1;
+  if (PS4.Left()) mask |= 1 << 2;
+  if (PS4.Right()) mask |= 1 << 3;
+  if (PS4.Square()) mask |= 1 << 4;
+  if (PS4.Cross()) mask |= 1 << 5;
+  if (PS4.Circle()) mask |= 1 << 6;
+  if (PS4.Triangle()) mask |= 1 << 7;
+  if (PS4.L1()) mask |= 1 << 8;
+  if (PS4.R1()) mask |= 1 << 9;
+  if (PS4.Share()) mask |= 1 << 10;
+  if (PS4.Options()) mask |= 1 << 11;
+  if (PS4.L3()) mask |= 1 << 12;
+  if (PS4.R3()) mask |= 1 << 13;
+  if (PS4.PSButton()) mask |= 1 << 14;
+  if (PS4.Touchpad()) mask |= 1 << 15;
+  return mask;
+}
+
+
+void setupPS4Controller() {
+  uint8_t bt_mac[6];
+  esp_read_mac(bt_mac, ESP_MAC_BT);
+  DEBUG_SERIAL.printf("Bluetooth Mac Address => %02X:%02X:%02X:%02X:%02X:%02X\n",
+      bt_mac[0], bt_mac[1], bt_mac[2], bt_mac[3], bt_mac[4], bt_mac[5]);
+
+  PS4.attachOnConnect(handlePS4Connect);
+  PS4.attachOnDisconnect(handlePS4Disconnect);
+  ps4_enabled = PS4.begin();
+
+  if (ps4_enabled) {
+    DEBUG_SERIAL.println("PS4 controller host ready.");
+    DEBUG_SERIAL.println("Please pair the gamepad to the Bluetooth MAC above and press HOME.");
+  } else {
+    DEBUG_SERIAL.println("PS4 controller host init failed.");
+  }
+}
+
+
+float velocityCommandFromPS4Ly(int ly) {
+  ly = constrain(ly, -127, 127);
+
+  int abs_ly = ly >= 0 ? ly : -ly;
+  if (abs_ly <= PS4_LY_DEADBAND) {
+    return 0.0f;
+  }
+
+  float magnitude = (float)(abs_ly - PS4_LY_DEADBAND) / (float)(127 - PS4_LY_DEADBAND);
+  float sign = ly >= 0 ? 1.0f : -1.0f;
+  return sign * magnitude * VELOCITY_CMD_LIMIT_MPS;
+}
+
+
+void clearPS4VelocityCommand() {
+  ps4_ly = 0;
+  ps4_velocity_cmd_mps = 0.0f;
+  velocity_cmd_mps = 0.0f;
+  ps4_status_dirty = true;
+}
+
+
+void updatePS4VelocityCommand() {
+  ps4_ly = constrain((int)PS4.LStickY(), -127, 127);
+  ps4_velocity_cmd_mps = velocityCommandFromPS4Ly(ps4_ly);
+  velocity_cmd_mps = ps4_velocity_cmd_mps;
+}
+
+
+bool pingDynamixels() {
+  bool ping_L = false;
+  bool ping_R = false;
+
+  for (int i = 0; i < DXL_PING_RETRIES; ++i) {
+    ping_L = dxl.ping(DXL_ID_L);
+    ping_R = dxl.ping(DXL_ID_R);
+
+    DEBUG_PRINT("ping try ");
+    DEBUG_PRINT(i + 1);
+    DEBUG_PRINT(" L: ");
+    DEBUG_PRINT(ping_L);
+    DEBUG_PRINT(", R: ");
+    DEBUG_PRINTLN(ping_R);
+
+    if (ping_L && ping_R) {
+      return true;
+    }
+    delay(DXL_PING_RETRY_DELAY_MS);
+  }
+
+  return false;
+}
+
+
+void pollPS4Controller() {
+  if (!ps4_enabled) {
+    return;
+  }
+
+  if (ps4_connect_event) {
+    ps4_connect_event = false;
+    ps4_connected = true;
+    ps4_status_dirty = true;
+    clearPS4VelocityCommand();
+    DEBUG_SERIAL.println("PS4 controller connected");
+    PS4.setLed(0, 32, 64);
+    PS4.sendToController();
+  }
+
+  if (ps4_disconnect_event) {
+    ps4_disconnect_event = false;
+    ps4_connected = false;
+    clearPS4VelocityCommand();
+    DEBUG_SERIAL.println("PS4 controller disconnected");
+  }
+
+  bool connected_now = PS4.isConnected();
+  if (connected_now != ps4_connected) {
+    ps4_connected = connected_now;
+    ps4_status_dirty = true;
+    if (!ps4_connected) {
+      clearPS4VelocityCommand();
+    }
+    DEBUG_SERIAL.println(ps4_connected ? "PS4 controller connected" : "PS4 controller disconnected");
+  }
+
+  if (!ps4_connected) {
+    return;
+  }
+
+  updatePS4VelocityCommand();
+
+  unsigned long now = millis();
+  if (now - ps4_last_report_ms < PS4_REPORT_PERIOD_MS) {
+    return;
+  }
+  ps4_last_report_ms = now;
+
+  DEBUG_SERIAL.printf("PS4,ly=%d,vcmd=%.4f\n", ps4_ly, ps4_velocity_cmd_mps);
+
+  // Raw PS4 input dump. Re-enable when diagnosing controller packets.
+  // DEBUG_PRINTF(
+  //     "PS4,bat=%u,lx=%d,ly=%d,vcmd=%.4f,rx=%d,ry=%d,l2=%u,r2=%u,buttons=0x%04X\n",
+  //     PS4.Battery(),
+  //     PS4.LStickX(),
+  //     ps4_ly,
+  //     ps4_velocity_cmd_mps,
+  //     PS4.RStickX(),
+  //     PS4.RStickY(),
+  //     PS4.L2Value(),
+  //     PS4.R2Value(),
+  //     ps4ButtonMask());
 }
 
 
@@ -372,10 +570,20 @@ void calcFuzzy(){
 
   float v_cmd = constrain(velocity_cmd_mps, -VELOCITY_CMD_LIMIT_MPS, VELOCITY_CMD_LIMIT_MPS);
   float v_err = v_cmd - telem_v_fwd;
-  fuzzy_vel_integral = constrain(
-      fuzzy_vel_integral + v_err * dt,
-      -FUZZY_VEL_INT_MAX_M,
-      FUZZY_VEL_INT_MAX_M);
+  bool v_cmd_zero = fabsf(v_cmd) <= VELOCITY_INTEGRAL_CMD_DEADBAND_MPS;
+  bool v_cmd_reversed =
+      fabsf(v_cmd) > VELOCITY_INTEGRAL_CMD_DEADBAND_MPS
+      && fabsf(previous_v_cmd_mps) > VELOCITY_INTEGRAL_CMD_DEADBAND_MPS
+      && v_cmd * previous_v_cmd_mps < 0.0f;
+  if (v_cmd_zero || v_cmd_reversed) {
+    fuzzy_vel_integral = 0.0f;
+  } else {
+    fuzzy_vel_integral = constrain(
+        fuzzy_vel_integral + v_err * dt,
+        -FUZZY_VEL_INT_MAX_M,
+        FUZZY_VEL_INT_MAX_M);
+  }
+  previous_v_cmd_mps = v_cmd;
 
   telem_theta_ref_trim = stationHoldTrim(v_cmd, telem_odom_x, telem_v_fwd, dt);
   float theta_ref = bilinearInterp(
@@ -388,6 +596,9 @@ void calcFuzzy(){
       FUZZY_VEL_INT_MAX_M);
   theta_ref += telem_theta_ref_trim;
   theta_ref = constrain(theta_ref, -FUZZY_THETA_REF_MAX_RAD, FUZZY_THETA_REF_MAX_RAD);
+  if (v_cmd_zero && fabsf(telem_v_fwd) <= VELOCITY_NEUTRAL_SPEED_DEADBAND_MPS) {
+    theta_ref = 0.0f;
+  }
   telem_theta_ref = theta_ref;
 
   float theta_err = theta - theta_ref;
@@ -409,9 +620,30 @@ void calcFuzzy(){
 
   driveMotorCtrl(ctrl_L, ctrl_R);
 
+  if (++vel_debug_counter >= VEL_DEBUG_DECIMATION) {
+    vel_debug_counter = 0;
+    DEBUG_SERIAL.printf(
+        "VELDBG,t=%lu,ps4=%d,ly=%d,ps4_cmd=%.4f,cmd=%.4f,v_cmd=%.4f,v_fwd=%.4f,v_err=%.4f,vel_int=%.4f,theta_ref=%.4f,ctrl=%.3f,curL=%.4f,curR=%.4f,velL=%.1f,velR=%.1f\n",
+        millis(),
+        ps4_connected ? 1 : 0,
+        ps4_ly,
+        ps4_velocity_cmd_mps,
+        velocity_cmd_mps,
+        v_cmd,
+        telem_v_fwd,
+        v_err,
+        fuzzy_vel_integral,
+        theta_ref,
+        ctrl_base,
+        telem_current_L,
+        telem_current_R,
+        telem_vel_L,
+        telem_vel_R);
+  }
+
   if (++telem_counter >= TELEM_DECIMATION) {
     telem_counter = 0;
-    DEBUG_SERIAL.printf("T,%lu,%.0f,%.2f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.1f,%.1f,%d\n",
+    DEBUG_PRINTF("T,%lu,%.0f,%.2f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.1f,%.1f,%d\n",
         millis(), dt * 1000000.0f, pitch_kalman,
         theta, theta_ref, telem_theta_ref_trim, theta_dot_lpf,
         telem_v_fwd, v_cmd, fuzzy_vel_integral, telem_odom_x,
@@ -438,11 +670,28 @@ void drawButton(const char* label, int x, int y, float value) {
 }
 
 
+void drawPS4Status() {
+  M5.Display.fillRect(20, 150, 290, 24, BLACK);
+  M5.Display.setCursor(20, 150);
+
+  if (!ps4_enabled) {
+    M5.Display.print("PS4: init failed");
+  } else if (ps4_connected) {
+    M5.Display.printf("PS4: Bat:%u LY:%d", PS4.Battery(), ps4_ly);
+  } else {
+    M5.Display.print("PS4: waiting HOME");
+  }
+}
+
+
 void drawCtrlPanel(){
   drawButton("Ref", 20, 30, pitch_target);
   drawButton("Scale", 20, 70, fuzzy_current_scale);
   drawButton("Vcmd", 20, 110, velocity_cmd_mps);
 
+  drawPS4Status();
+
+  M5.Display.fillRect(20, 190, 290, 24, BLACK);
   M5.Display.setCursor(20, 190);
   int batteryPercentage = M5.Power.getBatteryLevel();
   M5.Display.printf("M5Core2 Battery: %d%%", batteryPercentage);
@@ -489,6 +738,7 @@ void uiLoopTask(void *pvParameters){
   TickType_t xLastWakeTime = xTaskGetTickCount();  
   while(true){
     M5.update();
+    pollPS4Controller();
 
     //draw avatar face
     if (M5.BtnA.wasPressed()) {
@@ -510,6 +760,16 @@ void uiLoopTask(void *pvParameters){
     }
     
     if (enShowCtrlPanel) {
+      unsigned long now = millis();
+      if (ps4_status_dirty || now - ps4_last_status_draw_ms >= PS4_STATUS_DRAW_PERIOD_MS) {
+        drawPS4Status();
+        if (ps4_connected) {
+          drawButton("Vcmd", 20, 110, velocity_cmd_mps);
+        }
+        ps4_status_dirty = false;
+        ps4_last_status_draw_ms = now;
+      }
+
       bool isReleased = true;
         if (M5.Touch.getCount()>0 && isReleased) {
           isReleased = false;
@@ -544,21 +804,20 @@ void setup(){
   dxl = Dynamixel2Arduino(DXL_SERIAL);
   dxl.begin(BAUD_DXL);
 
-  DEBUG_SERIAL.println("DYNAMIXEL ping Waiting...");
+  DEBUG_PRINTLN("DYNAMIXEL ping Waiting...");
 
   dxl.setPortProtocolVersion(DXL_PROTOCOL_VERSION);
 
-  DEBUG_SERIAL.print("ping L: ");
-  DEBUG_SERIAL.print(dxl.ping(DXL_ID_L));
-  DEBUG_SERIAL.print(", ping R: ");
-  DEBUG_SERIAL.println(dxl.ping(DXL_ID_R));
-
-  if (!dxl.ping(DXL_ID_L) || !dxl.ping(DXL_ID_R)) {
+  if (!pingDynamixels()) {
+    DEBUG_SERIAL.println("DYNAMIXEL ping failed!");
     M5.Lcd.println("DYNAMIXEL ping failed!");
-    while (true) delay(1000);
+    while (true) {
+      pollPS4Controller();
+      delay(25);
+    }
   }
 
-  DEBUG_SERIAL.println("DYNAMIXEL ping OK");
+  DEBUG_PRINTLN("DYNAMIXEL ping OK");
 
   dxl.torqueOff(DXL_ID_L);
   dxl.torqueOff(DXL_ID_R);
@@ -608,14 +867,17 @@ void setup(){
   // Kalman filter Setting
   kalman.setAngle(getPitch());
 
-  DEBUG_SERIAL.println("# Controller: VEGA fuzzy grid");
-  DEBUG_SERIAL.println("# Artifact: tables/vega_best_mujoco_teleop_200hz_stationhold.npz");
-  DEBUG_SERIAL.printf("# ctrl_limit=%f, ctrl_to_current_A=%f, current_limit_A=%f\n",
+  // PS4 controller host setup
+  setupPS4Controller();
+
+  DEBUG_PRINTLN("# Controller: VEGA fuzzy grid");
+  DEBUG_PRINTLN("# Artifact: tables/vega_best_mujoco_teleop_200hz_stationhold.npz");
+  DEBUG_PRINTF("# ctrl_limit=%f, ctrl_to_current_A=%f, current_limit_A=%f\n",
       FUZZY_CTRL_LIMIT, FUZZY_CTRL_TO_CURRENT_A, SOFTWARE_CURRENT_LIMIT_A);
-  DEBUG_SERIAL.printf("# real_tune: current_scale=%f, theta_err_max=%f, theta_rate_max=%f, d_lpf_tau=%f, station_hold_gain=%f\n",
+  DEBUG_PRINTF("# real_tune: current_scale=%f, theta_err_max=%f, theta_rate_max=%f, d_lpf_tau=%f, station_hold_gain=%f\n",
       fuzzy_current_scale, FUZZY_THETA_ERR_MAX_RAD, FUZZY_THETA_RATE_MAX_RAD_S,
       D_LPF_TAU_S, STATION_HOLD_GAIN);
-  DEBUG_SERIAL.println("T,t_ms,dt_us,pitch,theta,theta_ref,theta_trim,theta_dot,v_mps,v_cmd,vel_int,odom_x,ctrl_base,ctrl_yaw,ctrl_L,yaw_rate,current_L,current_R,vel_L_rpm,vel_R_rpm,hold_state");
+  DEBUG_PRINTLN("T,t_ms,dt_us,pitch,theta,theta_ref,theta_trim,theta_dot,v_mps,v_cmd,vel_int,odom_x,ctrl_base,ctrl_yaw,ctrl_L,yaw_rate,current_L,current_R,vel_L_rpm,vel_R_rpm,hold_state");
   
   // RTOS Task Settings
   const uint32_t MEMORY_STACK = 8192;
