@@ -73,7 +73,7 @@ const float FUZZY_CTRL_LIMIT = FUZZY_FORCE_LIMIT_NM / FUZZY_MOTOR_GEAR;
 const float FUZZY_CTRL_TO_CURRENT_A = SOFTWARE_CURRENT_LIMIT_A / FUZZY_CTRL_LIMIT;
 const float PSI_ERR_MAX_RAD_S = 2.0f;
 const float YAW_RATE_SIGN = 1.0f;
-const float VELOCITY_CMD_LIMIT_MPS = 0.04f;
+const float VELOCITY_CMD_LIMIT_MPS = 0.08f;
 
 const float STATION_HOLD_GAIN = 0.0f;
 const float STATION_HOLD_DEADBAND_MPS = 0.005f;
@@ -84,6 +84,9 @@ const uint32_t PS4_STATUS_DRAW_PERIOD_MS = 500;
 const int PS4_LY_DEADBAND = 8;
 const int DXL_PING_RETRIES = 3;
 const uint32_t DXL_PING_RETRY_DELAY_MS = 50;
+const int VEL_DEBUG_DECIMATION = 40;
+const float VELOCITY_INTEGRAL_CMD_DEADBAND_MPS = 0.005f;
+const float VELOCITY_NEUTRAL_SPEED_DEADBAND_MPS = 0.005f;
 
 const float T_THETA[FUZZY_GRID_N][FUZZY_GRID_N] = {
   {-42.91900f, -37.72867f, -37.02978f, -42.68309f, -38.84818f, -44.06319f, -11.98498f, -1.037281f, 2.478805f, -10.20923f, -4.862647f},
@@ -121,6 +124,7 @@ const float T_PSI[FUZZY_GRID_N] = {
 // Fuzzy controller state
 float theta_dot_lpf = 0.0f;
 float fuzzy_vel_integral = 0.0f;
+float previous_v_cmd_mps = 0.0f;
 float fuzzy_current_scale = 0.75f;
 float velocity_cmd_mps = 0.0f;
 
@@ -154,6 +158,7 @@ DYNAMIXEL::InfoSyncWriteInst_t sw_info;
 // Telemetry (20Hz output)
 const int TELEM_DECIMATION = 10;
 int telem_counter = 0;
+int vel_debug_counter = 0;
 float telem_vel_L = 0.0f;
 float telem_vel_R = 0.0f;
 float telem_v_fwd = 0.0f;
@@ -245,6 +250,7 @@ float interp1D(const float table[FUZZY_GRID_N], float x, float x_max) {
 void resetFuzzyState() {
   theta_dot_lpf = 0.0f;
   fuzzy_vel_integral = 0.0f;
+  previous_v_cmd_mps = 0.0f;
   station_hold_has_x = false;
   station_hold_dwell_s = 0.0f;
   telem_theta_ref = 0.0f;
@@ -407,7 +413,7 @@ void pollPS4Controller() {
   }
   ps4_last_report_ms = now;
 
-  DEBUG_SERIAL.printf("PS4,vcmd=%.4f\n", ps4_velocity_cmd_mps);
+  DEBUG_SERIAL.printf("PS4,ly=%d,vcmd=%.4f\n", ps4_ly, ps4_velocity_cmd_mps);
 
   // Raw PS4 input dump. Re-enable when diagnosing controller packets.
   // DEBUG_PRINTF(
@@ -564,10 +570,20 @@ void calcFuzzy(){
 
   float v_cmd = constrain(velocity_cmd_mps, -VELOCITY_CMD_LIMIT_MPS, VELOCITY_CMD_LIMIT_MPS);
   float v_err = v_cmd - telem_v_fwd;
-  fuzzy_vel_integral = constrain(
-      fuzzy_vel_integral + v_err * dt,
-      -FUZZY_VEL_INT_MAX_M,
-      FUZZY_VEL_INT_MAX_M);
+  bool v_cmd_zero = fabsf(v_cmd) <= VELOCITY_INTEGRAL_CMD_DEADBAND_MPS;
+  bool v_cmd_reversed =
+      fabsf(v_cmd) > VELOCITY_INTEGRAL_CMD_DEADBAND_MPS
+      && fabsf(previous_v_cmd_mps) > VELOCITY_INTEGRAL_CMD_DEADBAND_MPS
+      && v_cmd * previous_v_cmd_mps < 0.0f;
+  if (v_cmd_zero || v_cmd_reversed) {
+    fuzzy_vel_integral = 0.0f;
+  } else {
+    fuzzy_vel_integral = constrain(
+        fuzzy_vel_integral + v_err * dt,
+        -FUZZY_VEL_INT_MAX_M,
+        FUZZY_VEL_INT_MAX_M);
+  }
+  previous_v_cmd_mps = v_cmd;
 
   telem_theta_ref_trim = stationHoldTrim(v_cmd, telem_odom_x, telem_v_fwd, dt);
   float theta_ref = bilinearInterp(
@@ -580,6 +596,9 @@ void calcFuzzy(){
       FUZZY_VEL_INT_MAX_M);
   theta_ref += telem_theta_ref_trim;
   theta_ref = constrain(theta_ref, -FUZZY_THETA_REF_MAX_RAD, FUZZY_THETA_REF_MAX_RAD);
+  if (v_cmd_zero && fabsf(telem_v_fwd) <= VELOCITY_NEUTRAL_SPEED_DEADBAND_MPS) {
+    theta_ref = 0.0f;
+  }
   telem_theta_ref = theta_ref;
 
   float theta_err = theta - theta_ref;
@@ -600,6 +619,27 @@ void calcFuzzy(){
   float ctrl_R = constrain(ctrl_base + telem_ctrl_yaw, -FUZZY_CTRL_LIMIT, FUZZY_CTRL_LIMIT);
 
   driveMotorCtrl(ctrl_L, ctrl_R);
+
+  if (++vel_debug_counter >= VEL_DEBUG_DECIMATION) {
+    vel_debug_counter = 0;
+    DEBUG_SERIAL.printf(
+        "VELDBG,t=%lu,ps4=%d,ly=%d,ps4_cmd=%.4f,cmd=%.4f,v_cmd=%.4f,v_fwd=%.4f,v_err=%.4f,vel_int=%.4f,theta_ref=%.4f,ctrl=%.3f,curL=%.4f,curR=%.4f,velL=%.1f,velR=%.1f\n",
+        millis(),
+        ps4_connected ? 1 : 0,
+        ps4_ly,
+        ps4_velocity_cmd_mps,
+        velocity_cmd_mps,
+        v_cmd,
+        telem_v_fwd,
+        v_err,
+        fuzzy_vel_integral,
+        theta_ref,
+        ctrl_base,
+        telem_current_L,
+        telem_current_R,
+        telem_vel_L,
+        telem_vel_R);
+  }
 
   if (++telem_counter >= TELEM_DECIMATION) {
     telem_counter = 0;
