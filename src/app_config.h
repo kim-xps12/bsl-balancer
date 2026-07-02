@@ -1,0 +1,117 @@
+// app_config.h — 全定数の単一情報源 (SSOT)
+// 設計書: docs/plans/2026-07-02-current-mode-freertos-redesign.md
+// 単位は SI (rad, rad/s, m, m/s, A, s)。TUNE = 実機調整前提の初期値。
+#pragma once
+
+#include <cstdint>
+
+namespace cfg {
+
+// ---- 制御周期 (§3.3) ----
+constexpr uint32_t kControlPeriodMs = 5;    // 200 Hz
+constexpr float    kControlPeriodS  = 0.005f;
+constexpr float    kDtFaultFactor   = 1.5f; // dt > 1.5x周期 が連続で FAULT
+constexpr int      kDtFaultConsecutive = 5;
+
+// ---- ハードウェア (PORT A / DYNAMIXEL) ----
+constexpr uint8_t  kPinRxServo = 33;
+constexpr uint8_t  kPinTxServo = 32;
+constexpr uint32_t kDxlBaud    = 1000000;
+constexpr uint8_t  kDxlIdLeft  = 0;
+constexpr uint8_t  kDxlIdRight = 1;
+constexpr uint16_t kDxlModelNumber = 1190; // XL330-M077
+constexpr float    kDxlProtocol = 2.0f;
+
+// ---- 機体諸元 ----
+constexpr float kWheelRadiusM = 0.029f;  // TAMIYA ナロータイヤ 58mm 径
+
+// ---- 符号規約 (§4.2/§7 実機符号試験で確定。指令と帰還の両方に適用) ----
+constexpr float kSignLeft  = -1.0f; // 現行実装準拠 (L に -指令で前進)
+constexpr float kSignRight = +1.0f;
+
+// ---- IMU / 姿勢推定 (§5) ----
+constexpr float kEstimatorTauS      = 1.0f;   // 相補融合時定数 TUNE
+constexpr float kAccelGateG         = 0.3f;   // ||a|-1g| > 0.3g で補正停止
+constexpr float kGravity            = 9.80665f;
+constexpr float kGyroCalibDurationS = 1.5f;   // 起動時静止校正
+constexpr int   kImuStaleFaultCycles = 5;     // gyro stale 連続 25ms で FAULT
+
+// ---- DXL 通信規律 (§4.2) ----
+constexpr uint32_t kDxlIoTimeoutMs        = 2;   // 全トランザクション明示タイムアウト
+constexpr float    kDxlCycleBudgetS       = 0.003f; // 1周期内 DXL 総予算 3ms
+constexpr int      kDxlReadStaleFaultCycles = 4; // 読取失敗 連続 20ms で FAULT
+constexpr float    kUnverifiedTorqueMaxS  = 0.010f; // 未検証トルク窓 (壁時計)
+constexpr uint8_t  kBusWatchdogRaw        = 1;   // 20ms (raw 1 = 最小)
+constexpr float    kBusWatchdogWindowS    = 0.020f;
+constexpr float    kQuarantineSilenceS    = 0.040f; // 検疫沈黙窓 (Watchdog窓+余裕)
+constexpr int      kWatchdogRecoverMaxCount = 3;  // 60s 内 3 回で FAULT
+constexpr float    kWatchdogRecoverWindowS  = 60.0f;
+
+// ---- 電流制限 3 層 + I²t (§2.3) ----
+constexpr float kCurrentLimitNormalA  = 0.900f; // EEPROM Current Limit(38) TUNE
+constexpr float kCurrentLimitBringupA = 0.150f; // ブリングアップ・プロファイル
+constexpr float kCurrentPeakA         = 0.450f; // ソフトピーク TUNE
+constexpr float kCurrentContA         = 0.300f; // ソフト連続 TUNE
+constexpr float kPeakDurationS        = 0.5f;   // I²t: E_max=(Ip²-Ic²)*Tpeak TUNE
+constexpr float kCurrentSlewAPerS     = 5.0f;   // スルーレート TUNE
+
+// ---- 電流妥当性監視 (§6。Present Current は電源側電流のため寛大に) ----
+constexpr float kCurrentMismatchA      = 0.300f; // |I_present-I_cmd| 閾値 TUNE
+constexpr float kCurrentResidualA      = 0.100f; // 零指令中の残留閾値 TUNE
+constexpr float kCurrentPlausDwellS    = 0.200f;
+
+// ---- 速度ガード (§2.1 / XL330規範 §11。無負荷 383rpm≈40.1rad/s) ----
+constexpr float kWheelSpeedSoftRadS = 25.0f; // TUNE
+constexpr float kWheelSpeedHardRadS = 35.0f; // 超過で FAULT TUNE
+
+// ---- 制御ゲイン初期値 (§2.2 TUNE) ----
+constexpr float kPitchKp        = 1.5f;    // [A/rad]
+constexpr float kPitchKi        = 0.0f;    // [A/(rad*s)] Bala2 実績に従い 0
+constexpr float kPitchKd        = 0.08f;   // [A/(rad/s)]
+constexpr float kPitchILimitA   = 0.15f;   // 積分項クランプ [A]
+constexpr float kDTermLpfHz     = 25.0f;   // D 項 PT1 カットオフ
+constexpr float kVelKv          = 0.10f;   // [rad/(m/s)]
+constexpr float kVelKvi         = 0.05f;   // [rad/m]
+constexpr float kThetaRefLimitRad = 0.0524f; // ±3° クランプ
+constexpr bool  kVelLoopEnabledDefault = true;
+constexpr float kPitchEqDefaultRad = 0.0f; // 平衡点校正値 (0中心 θ の単一変換点でのみ使用)
+
+// ---- 状態機械 (§6) ----
+constexpr float kFallThresholdRad    = 0.611f;  // 35°
+constexpr float kStartWindowRad      = 0.0873f; // 5°
+constexpr float kStartRateMaxRadS    = 0.35f;   // ~20°/s
+constexpr float kStartWheelMaxRadS   = 1.0f;
+constexpr float kUprightHoldS        = 1.0f;    // 起立/静置検出の保持時間
+constexpr int   kFallEscalationCount = 3;       // 30s 内 3 回で FAULT ラッチ
+constexpr float kFallEscalationWindowS = 30.0f;
+constexpr bool  kAutoArmOnBootDefault  = true;  // コミッショニング後のみ有効 (Q5)
+
+// ---- ヘルス監視閾値 ----
+constexpr float kVoltageMinV   = 3.6f;  // AAA×3 のサグ考慮 TUNE
+constexpr float kTempMaxC      = 65.0f; // XL330 Shutdown(70°C 相当) 手前 TUNE
+
+// ---- UI ----
+constexpr uint32_t kUiPeriodMs        = 33;
+constexpr uint32_t kBtnLongPressMs    = 1000; // BtnC STOP/ARM トグル
+
+// ---- NVS レコード (§9.1) ----
+constexpr uint16_t kParamSchemaVersion       = 1;
+constexpr uint16_t kCommissionSchemaVersion  = 1;
+
+// ---- パラメータ許容範囲 [min, max] (§9.1 範囲検証。1つでも外れたら全体破棄) ----
+struct ParamRange { float min; float max; };
+constexpr ParamRange kRangeKp        {0.0f, 10.0f};
+constexpr ParamRange kRangeKi        {0.0f, 5.0f};
+constexpr ParamRange kRangeKd        {0.0f, 1.0f};
+constexpr ParamRange kRangeKv        {0.0f, 1.0f};
+constexpr ParamRange kRangeKvi       {0.0f, 1.0f};
+constexpr ParamRange kRangePitchEq   {-0.35f, 0.35f}; // ±20°
+constexpr ParamRange kRangeThetaRefLimit {0.0f, 0.175f}; // ±10°
+
+// ---- プロファイル (§4.1) ----
+enum class Profile : uint8_t { Bringup = 0, Normal = 1 };
+constexpr float currentLimitFor(Profile p) {
+  return p == Profile::Bringup ? kCurrentLimitBringupA : kCurrentLimitNormalA;
+}
+
+}  // namespace cfg
