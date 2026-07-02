@@ -523,7 +523,7 @@ static void test_params_reject_invalid() {
 }
 
 static void test_commissioning_fail_closed() {
-  const uint32_t csum = signAxisChecksum(cfg::kSignLeft, cfg::kSignRight);
+  const uint32_t csum = currentSignAxisChecksum();
   CommissioningRecord rec;
   rec.schema_version = cfg::kCommissionSchemaVersion;
   rec.profile = static_cast<uint8_t>(cfg::Profile::Normal);
@@ -532,9 +532,16 @@ static void test_commissioning_fail_closed() {
   rec.user_confirmed = true;
   TEST_ASSERT_TRUE(validateCommissioning(rec, csum, 3));
 
-  // 符号定数が変わった (チェックサム不一致) → 未コミッショニング扱い
-  const uint32_t csum_flipped = signAxisChecksum(-cfg::kSignLeft, cfg::kSignRight);
-  TEST_ASSERT_FALSE(validateCommissioning(rec, csum_flipped, 3));
+  // 車輪符号が変わった (チェックサム不一致) → 未コミッショニング扱い
+  const uint32_t csum_wheel = signAxisChecksum(
+      -cfg::kSignLeft, cfg::kSignRight, cfg::kImuAccTiltSign,
+      cfg::kImuAccVertSign, cfg::kImuGyroSign);
+  TEST_ASSERT_FALSE(validateCommissioning(rec, csum_wheel, 3));
+  // IMU 軸符号が変わっても無効化される (gate2 P2 回帰)
+  const uint32_t csum_imu = signAxisChecksum(
+      cfg::kSignLeft, cfg::kSignRight, -cfg::kImuAccTiltSign,
+      cfg::kImuAccVertSign, cfg::kImuGyroSign);
+  TEST_ASSERT_FALSE(validateCommissioning(rec, csum_imu, 3));
   // 校正版が進んだ
   TEST_ASSERT_FALSE(validateCommissioning(rec, csum, 4));
   // 未確認フラグ

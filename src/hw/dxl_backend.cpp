@@ -178,18 +178,21 @@ bool DxlBackend::init(cfg::Profile profile) {
       if (!readRaw(id, kAddrShutdown, 1, &sd)) return false;
     }
 
+    // 前回稼働の Watchdog トリップ残留を先に解除する (トリップ中は Goal 値が
+    // read-only になり零書込が失敗するため、零書込より前に行う)
+    uint8_t wd = 0;
+    if (!readRaw(id, kAddrBusWatchdog, 1, &wd)) return false;
+    if (wd == kWatchdogTripped) {
+      if (!writeRaw1(id, kAddrBusWatchdog, 0)) return false;
+    }
+
     // ★Goal Current=0 (モード変更で Current Limit 値へ自動セットされるため必須)
     {
       const uint8_t z[2] = {0, 0};
       if (!verifiedWrite(id, kAddrGoalCurrent, z, 2)) return false;
     }
 
-    // Bus Watchdog 有効化 (raw 1 = 20ms)。トリップ残留があれば先に解除。
-    uint8_t wd = 0;
-    if (!readRaw(id, kAddrBusWatchdog, 1, &wd)) return false;
-    if (wd == kWatchdogTripped) {
-      if (!writeRaw1(id, kAddrBusWatchdog, 0)) return false;
-    }
+    // Bus Watchdog 有効化 (raw 1 = 20ms)
     if (!writeRaw1(id, kAddrBusWatchdog, cfg::kBusWatchdogRaw)) return false;
   }
   // Torque は OFF のまま (Torque ON は enter_balancing() のみ §4.1)

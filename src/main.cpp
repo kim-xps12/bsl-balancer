@@ -61,16 +61,18 @@ void setup() {
   bool commissioned = false;
   if (hw::ParamStore::loadCommissioning(&comm)) {
     commissioned = core::validateCommissioning(
-        comm, core::signAxisChecksum(cfg::kSignLeft, cfg::kSignRight),
-        /*current_calib_version=*/1);
+        comm, core::currentSignAxisChecksum(), /*current_calib_version=*/1);
   }
   const cfg::Profile profile =
       commissioned ? cfg::Profile::Normal : cfg::Profile::Bringup;
 
-  // HW 初期化 (IMU → DXL §4.1)。失敗時もタスクは起動し FSM が FAULT を表示する。
-  bool init_ok = imu_backend.init();
+  // HW 初期化 (IMU / DXL §4.1)。互いに独立して実行する — IMU が死んでいても
+  // DXL 初期化 (前回稼働の残留トルクの解除経路) は必ず走らせる。
+  // 失敗時もタスクは起動し FSM が FAULT を表示する。
+  const bool imu_ok = imu_backend.init();
   DXL_SERIAL.begin(cfg::kDxlBaud, SERIAL_8N1, cfg::kPinRxServo, cfg::kPinTxServo);
-  init_ok = init_ok && dxl_backend.init(profile);
+  const bool dxl_ok = dxl_backend.init(profile);
+  const bool init_ok = imu_ok && dxl_ok;
 
   control_ctx.imu = &imu_backend;
   control_ctx.dxl = &dxl_backend;

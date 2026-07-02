@@ -117,7 +117,9 @@ class SafetyFsm {
       case FsmState::Idle: {
         if (in.stop_toggle) {
           state_ = FsmState::Disarmed;
-          r.action = FsmAction::SafeStop;  // 冪等 (既に Torque OFF)
+          // 既に Torque OFF。保存ゲート中はバス送信が拒否され偽 FAULT になる
+          // ため SafeStop を発行しない (§9.1)
+          r.action = in.save_in_progress ? FsmAction::None : FsmAction::SafeStop;
           break;
         }
         if (in.save_in_progress) {

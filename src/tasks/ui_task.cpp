@@ -120,8 +120,7 @@ void performSave(const shared::Snapshot& sn, shared::SharedState& sh,
     core::CommissioningRecord rec;
     rec.schema_version = cfg::kCommissionSchemaVersion;
     rec.profile = static_cast<uint8_t>(cfg::Profile::Normal);
-    rec.sign_axis_checksum =
-        core::signAxisChecksum(cfg::kSignLeft, cfg::kSignRight);
+    rec.sign_axis_checksum = core::currentSignAxisChecksum();
     rec.calib_version = 1;
     rec.user_confirmed = true;
     hw::ParamStore::saveCommissioning(rec);
