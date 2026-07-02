@@ -352,6 +352,25 @@ static void test_fsm_zero_centered_theta_contract() {
   TEST_ASSERT_TRUE(requested);
 }
 
+static void test_fsm_no_stale_upright_timer_after_fall() {
+  // アーム前の保持タイマが Fallen の静置検出に持ち越されないこと (gate2 P2 回帰)
+  SafetyFsm fsm;
+  fsm.setParams(fsmParams());
+  fsm.notifyInitDone();
+  float now = 0.0f;
+  driveUntilArm(fsm, &now, 1.2f);
+  fsm.notifyBalancingEntered();
+  // 長時間バランス後に転倒
+  now += 10.0f;
+  SafetyFsm::Input in = uprightInput(now += 0.005f);
+  in.theta = 0.7f;
+  fsm.update(in);
+  fsm.notifySafeStopDone();
+  // 最初の直立サンプル 1 回では Idle に戻らない (新規に 1.0s を要求)
+  const SafetyFsm::Result r = fsm.update(uprightInput(now += 0.005f));
+  TEST_ASSERT_EQUAL(static_cast<int>(FsmState::Fallen), static_cast<int>(r.state));
+}
+
 static void test_fsm_fall_and_recover() {
   SafetyFsm fsm;
   fsm.setParams(fsmParams());
@@ -383,7 +402,8 @@ static void test_fsm_fall_escalation() {
   fsm.notifyInitDone();
   float now = 0.0f;
   for (int fall = 0; fall < 3; ++fall) {
-    driveUntilArm(fsm, &now, 1.2f);
+    // 転倒後は Fallen静置1.0s + Idle起立1.0s の二段ゲートを通過して再アーム
+    driveUntilArm(fsm, &now, 2.4f);
     fsm.notifyBalancingEntered();
     SafetyFsm::Input in = uprightInput(now += 0.005f);
     in.theta = 0.7f;
@@ -553,6 +573,7 @@ int main(int, char**) {
   RUN_TEST(test_fsm_boot_gate);
   RUN_TEST(test_fsm_arm_sequence);
   RUN_TEST(test_fsm_zero_centered_theta_contract);
+  RUN_TEST(test_fsm_no_stale_upright_timer_after_fall);
   RUN_TEST(test_fsm_fall_and_recover);
   RUN_TEST(test_fsm_fall_escalation);
   RUN_TEST(test_fsm_stop_toggle);

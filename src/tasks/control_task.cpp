@@ -38,6 +38,7 @@ struct LoopState {
   core::SafetyFsm fsm;
   PlausibilityMonitor plaus_l, plaus_r;
   core::TuningParams params;
+  cfg::Profile profile = cfg::Profile::Bringup;
 
   int64_t prev_us = 0;
   float dt_max = 0.0f;
@@ -69,10 +70,29 @@ void applyBalanceParams(LoopState& ls) {
   bp.wheel_speed_soft = cfg::kWheelSpeedSoftRadS;
   bp.wheel_speed_hard = cfg::kWheelSpeedHardRadS;
   bp.slew_a_per_s = cfg::kCurrentSlewAPerS;
-  bp.i2t.i_peak = cfg::kCurrentPeakA;
-  bp.i2t.i_cont = cfg::kCurrentContA;
+  // ソフト上限はプロファイルの EEPROM Current Limit を超えない (超過指令は
+  // XL330 が範囲外エラーを返し verified_write が失敗するため §2.3)
+  const float eeprom_limit = cfg::currentLimitFor(ls.profile);
+  bp.i2t.i_peak = std::fmin(cfg::kCurrentPeakA, eeprom_limit);
+  bp.i2t.i_cont = std::fmin(cfg::kCurrentContA, bp.i2t.i_peak);
   bp.i2t.peak_duration_s = cfg::kPeakDurationS;
+  bp.pitch.out_limit = bp.i2t.i_peak;
   ls.balance.setParams(bp);
+}
+
+// 後段で検出したフォールトの FSM 反映 + SafeStop 実行を一体化する。
+// (update() の戻り action を捨てると Fault 遷移時の Torque OFF が失われる)
+void raiseFault(LoopState& ls, ControlContext& ctx, FaultReason reason,
+                float now_s) {
+  core::SafetyFsm::Input fi;
+  fi.fault = reason;
+  fi.now_s = now_s;
+  const core::SafetyFsm::Result r = ls.fsm.update(fi);
+  if (r.action == FsmAction::SafeStop) {
+    ctx.dxl->safeStop();  // 未検証なら backend が検疫を発動する (§4.2)
+    ls.fsm.notifySafeStopDone();
+    ls.last_cmd_l = ls.last_cmd_r = 0.0f;
+  }
 }
 
 void drainParamQueue(LoopState& ls, shared::SharedState& sh) {
@@ -107,6 +127,7 @@ void controlTaskEntry(void* pvParameters) {
   ControlContext& ctx = *static_cast<ControlContext*>(pvParameters);
   LoopState ls;
   ls.params = ctx.params;
+  ls.profile = ctx.profile;
 
   // 推定器・制御器・FSM の初期化
   core::AttitudeEstimator::Params ep;
@@ -148,17 +169,10 @@ void controlTaskEntry(void* pvParameters) {
                          static_cast<float>(gyro_sum / calib_n));
       ls.fsm.notifyInitDone();
     } else {
-      // IMU が動いていない → FAULT
-      core::SafetyFsm::Input fi;
-      fi.fault = FaultReason::InitFailed;
-      fi.now_s = nowSeconds();
-      ls.fsm.update(fi);
+      raiseFault(ls, ctx, FaultReason::InitFailed, nowSeconds());  // IMU 不動
     }
   } else {
-    core::SafetyFsm::Input fi;
-    fi.fault = FaultReason::InitFailed;
-    fi.now_s = nowSeconds();
-    ls.fsm.update(fi);
+    raiseFault(ls, ctx, FaultReason::InitFailed, nowSeconds());
   }
 
   ls.prev_us = esp_timer_get_time();
@@ -262,10 +276,7 @@ void controlTaskEntry(void* pvParameters) {
     } else if (fr.action == FsmAction::SafeStop) {
       // 零書込検証→Torque OFF。未検証なら backend が検疫を発動する (§4.2)
       if (!ctx.dxl->safeStop()) {
-        core::SafetyFsm::Input qi;
-        qi.fault = FaultReason::DxlWriteUnverified;
-        qi.now_s = now_s;
-        ls.fsm.update(qi);
+        raiseFault(ls, ctx, FaultReason::DxlWriteUnverified, now_s);
       } else {
         ls.fsm.notifySafeStopDone();
       }
@@ -303,10 +314,7 @@ void controlTaskEntry(void* pvParameters) {
         // 配達未検証 → 直ちに検証付き零書込 (§4.2)
         if (!ctx.dxl->writeZeroVerified()) {
           ctx.dxl->engageQuarantine();
-          core::SafetyFsm::Input qi;
-          qi.fault = FaultReason::DxlWriteUnverified;
-          qi.now_s = now_s;
-          ls.fsm.update(qi);
+          raiseFault(ls, ctx, FaultReason::DxlWriteUnverified, now_s);
         } else {
           if (!ls.unverified_active) {
             ls.unverified_active = true;
@@ -314,20 +322,14 @@ void controlTaskEntry(void* pvParameters) {
           } else if (static_cast<float>(now_us - ls.unverified_since_us) * 1e-6f >
                      cfg::kUnverifiedTorqueMaxS) {
             // 壁時計 10ms 超 → ラッチ FAULT (§4.2)
-            core::SafetyFsm::Input qi;
-            qi.fault = FaultReason::DxlWriteUnverified;
-            qi.now_s = now_s;
-            ls.fsm.update(qi);
+            raiseFault(ls, ctx, FaultReason::DxlWriteUnverified, now_s);
           }
           ls.last_cmd_l = ls.last_cmd_r = 0.0f;
         }
       }
 
       if (out.hard_overspeed) {
-        core::SafetyFsm::Input oi;
-        oi.fault = FaultReason::HardOverspeed;
-        oi.now_s = now_s;
-        ls.fsm.update(oi);
+        raiseFault(ls, ctx, FaultReason::HardOverspeed, now_s);
       }
     } else {
       // 心拍不変条件: 全状態で毎周期零書込 (検疫/保存ゲート中は backend が拒否)
@@ -341,10 +343,7 @@ void controlTaskEntry(void* pvParameters) {
       const bool pl = ls.plaus_l.update(ton, fb.valid, ls.last_cmd_l, fb.i_left, dt);
       const bool pr = ls.plaus_r.update(ton, fb.valid, ls.last_cmd_r, fb.i_right, dt);
       if (pl || pr) {
-        core::SafetyFsm::Input pi;
-        pi.fault = FaultReason::CurrentPlausibility;
-        pi.now_s = now_s;
-        ls.fsm.update(pi);
+        raiseFault(ls, ctx, FaultReason::CurrentPlausibility, now_s);
       }
     }
 

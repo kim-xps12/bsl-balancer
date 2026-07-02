@@ -35,12 +35,14 @@ bool raiseBmi270Odr() {
   return ok;
 }
 
-// 軸マップ: 縦置き (画面鉛直)。傾斜面 = YZ、傾斜レート = X 軸まわり (§5.1)。
-// v1.1(BMI270) の実装向き差異は §7 の符号試験で確認し、ここを config で吸収する。
+// 軸マップ: 縦置き (画面鉛直) では直立時に重力が +Y に載る。倒立設計は 0 中心 θ
+// を前提とするため、tilt = atan2(accZ, accY) (直立≈0) を推定器へ渡す (§2.1/§5.1)。
+// 旧ファームの atan2(accY, accZ)≈86° 基準とは異なる点に注意。gyro (X 軸まわり) は
+// この定義の時間微分と符号を合わせる (config で調整、§7 符号試験で確定)。
 void mapAxes(const m5::imu_data_t& d, core::ImuSample* s) {
-  s->gyro_rate = d.gyro.x * (units::kPi / 180.0f);  // M5Unified は dps
-  s->acc_tilt = d.accel.y * cfg::kGravity;          // M5Unified は g 単位
-  s->acc_vert = d.accel.z * cfg::kGravity;
+  s->gyro_rate = cfg::kImuGyroSign * d.gyro.x * (units::kPi / 180.0f);  // dps→rad/s
+  s->acc_tilt = cfg::kImuAccTiltSign * d.accel.z * cfg::kGravity;  // g→m/s^2
+  s->acc_vert = cfg::kImuAccVertSign * d.accel.y * cfg::kGravity;
   const float ax = d.accel.x, ay = d.accel.y, az = d.accel.z;
   s->acc_norm = std::sqrt(ax * ax + ay * ay + az * az) * cfg::kGravity;
 }

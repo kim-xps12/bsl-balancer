@@ -29,6 +29,14 @@ constexpr float kWheelRadiusM = 0.029f;  // TAMIYA ナロータイヤ 58mm 径
 constexpr float kSignLeft  = -1.0f; // 現行実装準拠 (L に -指令で前進)
 constexpr float kSignRight = +1.0f;
 
+// ---- IMU 軸マップ (§5.1 縦置き: 直立で重力≈+Y、傾斜で Z に射影) ----
+// tilt = atan2(sign_tilt*accZ, sign_vert*accY) が直立≈0・前傾で正になるよう
+// 符号試験 (§7) で確定する。gyro は atan2(Z,Y) の時間微分と同符号にする
+// (旧 atan2(Y,Z) 基準とは微分符号が反転するため既定 -1)。
+constexpr float kImuAccTiltSign = +1.0f;
+constexpr float kImuAccVertSign = +1.0f;
+constexpr float kImuGyroSign    = -1.0f;
+
 // ---- IMU / 姿勢推定 (§5) ----
 constexpr float kEstimatorTauS      = 1.0f;   // 相補融合時定数 TUNE
 constexpr float kAccelGateG         = 0.3f;   // ||a|-1g| > 0.3g で補正停止

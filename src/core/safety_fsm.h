@@ -88,6 +88,7 @@ class SafetyFsm {
   void notifyBalancingEntered() {
     if (state_ == FsmState::Idle && pending_ == FsmAction::EnterBalancing) {
       state_ = FsmState::Balancing;
+      upright_since_valid_ = false;  // 保持タイマを持ち越さない (転倒後の即時再アーム防止)
     }
     pending_ = FsmAction::None;
   }
@@ -140,6 +141,7 @@ class SafetyFsm {
         }
         if (fabsf_(in.theta) > p_.fall_threshold_rad) {
           registerFall(in.now_s);
+          upright_since_valid_ = false;  // Fallen の静置検出は新規に 1.0s を要求
           if (fall_count_ >= p_.fall_escalation_count) {
             latchFault(FaultReason::FallEscalation);
           } else {
