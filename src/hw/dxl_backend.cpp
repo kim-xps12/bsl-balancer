@@ -290,6 +290,12 @@ bool DxlBackend::enterBalancing() {
     uint8_t wd = 0;
     if (!readRaw(id, kAddrBusWatchdog, 1, &wd)) return false;
     if (wd == kWatchdogTripped) return false;  // 潜在トリップのまま Torque ON 禁止
+    if (wd != cfg::kBusWatchdogRaw) {
+      // 復旧途中失敗等で無効(0)のまま残った場合は再有効化してから進む
+      // (Watchdog なしで Torque ON しない — 最終防御の欠落を許さない)
+      if (!writeRaw1(id, kAddrBusWatchdog, cfg::kBusWatchdogRaw)) return false;
+      if (!verifyByte(id, kAddrBusWatchdog, cfg::kBusWatchdogRaw)) return false;
+    }
   }
   // Torque Enable==0 のまま Goal Current=0 を検証付き書込 (非零パルス遮断)
   if (!writeZeroVerified()) return false;

@@ -1,7 +1,7 @@
 // test_main.cpp — 純ロジック層のユニットテスト (設計書 §8 受入テスト)
 // 実行: ~/.platformio/penv/bin/pio test -e native
-#include <unity.h>
-
+// 注: Unity は math ヘッダ未取込時に isnan/isinf をマクロ定義し libc++ の
+// <cmath> を壊すため、C++ ヘッダを unity.h より先に include する。
 #include <cmath>
 
 #include "../../src/core/attitude_estimator.h"
@@ -10,6 +10,8 @@
 #include "../../src/core/pid.h"
 #include "../../src/core/safety_fsm.h"
 #include "../../src/core/units.h"
+
+#include <unity.h>
 
 using namespace core;
 
