@@ -187,12 +187,32 @@ static BalanceCore::Params testBalanceParams() {
   return p;
 }
 
+static void test_restoring_direction() {
+  // 復元則 (gate2 P1 回帰): 前傾 θ>0 → 前進電流 (正)。レートも同方向に寄与。
+  BalanceCore bc;
+  bc.setParams(testBalanceParams());
+  bc.reset();
+  BalanceCore::Input in;
+  in.theta = 0.1f;  // 前傾
+  in.wheel_valid = true;
+  in.dt = 0.005f;
+  const BalanceCore::Output out = bc.update(in);
+  TEST_ASSERT_TRUE(out.i_left > 0.0f);   // kp=2 → +0.2 A (前進)
+  TEST_ASSERT_FLOAT_WITHIN(1e-5f, 0.2f, out.i_left);
+  // 前進中 (v>0) は減速のため後傾参照 (θ_ref<0)
+  bc.reset();
+  in.theta = 0.0f;
+  in.v = 0.5f;
+  const BalanceCore::Output out2 = bc.update(in);
+  TEST_ASSERT_TRUE(out2.theta_ref < 0.0f);
+}
+
 static void test_mixer_inversion_priority() {
   BalanceCore bc;
   bc.setParams(testBalanceParams());
   bc.reset();
   BalanceCore::Input in;
-  in.theta = -1.0f;  // 巨大誤差 → i_common 飽和 (kp=2 → 2.0 → clamp 0.45)
+  in.theta = 1.0f;   // 巨大前傾 → i_common = +2.0 → clamp +0.45 (飽和)
   in.wheel_valid = true;
   in.i_yaw = 0.2f;   // ヘッドルーム 0 → yaw は完全に諦める
   in.dt = 0.005f;
@@ -207,13 +227,31 @@ static void test_mixer_yaw_headroom() {
   bc.setParams(testBalanceParams());
   bc.reset();
   BalanceCore::Input in;
-  in.theta = -0.1f;  // i_common = 0.2
+  in.theta = 0.1f;   // i_common = +0.2
   in.wheel_valid = true;
   in.i_yaw = 0.5f;   // headroom = 0.25 → clamp
   in.dt = 0.005f;
   const BalanceCore::Output out = bc.update(in);
   TEST_ASSERT_FLOAT_WITHIN(1e-5f, 0.2f - 0.25f, out.i_left);
   TEST_ASSERT_FLOAT_WITHIN(1e-5f, 0.2f + 0.25f, out.i_right);
+}
+
+static void test_slew_override_after_coast() {
+  // stale コースト時に送信実績 (0) へ整合させると、次周期は 0 起点で
+  // スルーレート制限される (gate2 P2 回帰)
+  BalanceCore::Params p = testBalanceParams();
+  p.slew_a_per_s = 10.0f;  // 1 周期 (5ms) あたり 0.05 A
+  BalanceCore bc;
+  bc.setParams(p);
+  bc.reset();
+  BalanceCore::Input in;
+  in.theta = 1.0f;  // 大電流要求
+  in.wheel_valid = true;
+  in.dt = 0.005f;
+  bc.update(in);                 // 計算は進む (0 → 0.05)
+  bc.overrideOutput(0.0f, 0.0f); // だが実際は 0 を送った (コースト)
+  const BalanceCore::Output out = bc.update(in);
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.05f, out.i_left);  // 0 起点の 1 ステップ分
 }
 
 static void test_speed_guard() {
@@ -572,8 +610,10 @@ int main(int, char**) {
   RUN_TEST(test_estimator_accel_gate);
   RUN_TEST(test_estimator_stale_hold);
   RUN_TEST(test_estimator_bias);
+  RUN_TEST(test_restoring_direction);
   RUN_TEST(test_mixer_inversion_priority);
   RUN_TEST(test_mixer_yaw_headroom);
+  RUN_TEST(test_slew_override_after_coast);
   RUN_TEST(test_speed_guard);
   RUN_TEST(test_i2t_symmetric_convergence);
   RUN_TEST(test_balance_stale_freezes_outer_loop);

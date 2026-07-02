@@ -133,8 +133,12 @@ class BalanceCore {
     }
     out.theta_ref = theta_ref_;
 
-    // 内側ピッチ PID → I_common
-    float i_common = pitch_pid_.update(theta_ref_, in.theta, in.theta_rate, in.dt);
+    // 内側ピッチ PID → I_common。倒立の復元則は「倒れる方向へ駆動」
+    // τ = Kp·(θ−θ_ref) + Kd·θ̇ (前傾 θ>0 で前進電流が正) なので、
+    // 誤差定義 e=ref−meas の PID 出力を負号反転して用いる (I/D も整合)。
+    const float i_common_raw =
+        -pitch_pid_.update(theta_ref_, in.theta, in.theta_rate, in.dt);
+    float i_common = i_common_raw;
 
     // ミキサ + 倒立優先飽和 (XL330規範 §10.1)。
     // saturated は「共通モードが上限に張り付いている」事実で判定
@@ -178,6 +182,13 @@ class BalanceCore {
 
   float velIntegrator() const { return vel_i_; }
   const Pid& pitchPid() const { return pitch_pid_; }
+
+  // 呼び出し側が計算結果と異なる電流を実際に送った場合 (stale コースト等) に
+  // スルーレート状態を送信実績へ整合させる (§4.2。I²t は保守側なので保持)
+  void overrideOutput(float i_left, float i_right) {
+    prev_left_ = i_left;
+    prev_right_ = i_right;
+  }
 
  private:
   static float slew(float prev, float target, float max_step) {

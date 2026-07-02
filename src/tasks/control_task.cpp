@@ -300,10 +300,11 @@ void controlTaskEntry(void* pvParameters) {
 
       float cmd_l = out.i_left, cmd_r = out.i_right;
       if (!fb.valid) { cmd_l = 0.0f; cmd_r = 0.0f; }  // 読取失敗周期はコースト (§4.2)
+      if (out.hard_overspeed) { cmd_l = cmd_r = 0.0f; }  // 今周期は零指令
 
-      if (out.hard_overspeed) {
-        // 過速度ハード → 次周期 FAULT (今周期は零指令)
-        cmd_l = cmd_r = 0.0f;
+      if (cmd_l != out.i_left || cmd_r != out.i_right) {
+        // 計算値と送信値が異なる周期はスルーレート状態を送信実績へ整合させる
+        ls.balance.overrideOutput(cmd_l, cmd_r);
       }
 
       if (ctx.dxl->writeGoalCurrentsVerified(cmd_l, cmd_r)) {
