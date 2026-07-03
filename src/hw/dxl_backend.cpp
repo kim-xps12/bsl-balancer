@@ -27,6 +27,7 @@ constexpr uint16_t kAddrPresentTemp = 146;
 constexpr uint16_t kAddrPwmLimit = 36;
 constexpr uint16_t kPwmLimitDefault = 885;
 constexpr uint8_t kWatchdogTripped = 0xFF;  // raw==0xFF (-1 の 1B 表現) = トリップ
+constexpr uint8_t kShutdownDefault = 53;    // XL330 既定 (0b00110101、e-manual 確認)
 
 constexpr uint8_t kIds[2] = {cfg::kDxlIdLeft, cfg::kDxlIdRight};
 
@@ -176,9 +177,14 @@ bool DxlBackend::init(cfg::Profile profile) {
       // PWM Limit(36) は全モード共通の出力上限 → 885(100%) を検証
       if (!readRaw(id, kAddrPwmLimit, 2, v)) return false;
       if (units::le16(v) != static_cast<int16_t>(kPwmLimitDefault)) return false;
-      // Shutdown(63) は既定値を読取記録 (変更しない)
+      // Shutdown(63) は既定値 53 (過熱/過負荷/電圧/ショック保護有効) を要求。
+      // 過去に無効化されたまま残っていたら安全既定へ復元して検証する
       uint8_t sd = 0;
       if (!readRaw(id, kAddrShutdown, 1, &sd)) return false;
+      if (sd != kShutdownDefault) {
+        if (!writeRaw1(id, kAddrShutdown, kShutdownDefault)) return false;
+        if (!verifyByte(id, kAddrShutdown, kShutdownDefault)) return false;
+      }
     }
 
     // 前回稼働の Watchdog トリップ残留を先に解除する (トリップ中は Goal 値が
@@ -371,7 +377,8 @@ WatchdogCheck DxlBackend::checkWatchdog(bool torque_may_be_on, float now_s) {
     recover_count_ = 0;
     recover_window_start_s_ = now_s;
   }
-  if (++recover_count_ > cfg::kWatchdogRecoverMaxCount) return WatchdogCheck::Fault;
+  // 「60s 内 3 回で FAULT」= 自動復旧を許すのは 2 回まで、3 回目の発生で FAULT
+  if (++recover_count_ >= cfg::kWatchdogRecoverMaxCount) return WatchdogCheck::Fault;
 
   for (uint8_t id : kIds) {
     if (!watchdogRecoverOne(id)) return WatchdogCheck::Fault;

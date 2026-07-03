@@ -376,11 +376,16 @@ void controlTaskEntry(void* pvParameters) {
           static_cast<float>(now_us - ls.save_gate_since_us) * 1e-6f > 3.0f;
       if (done || timeout) {
         ctx.dxl->setSaveGate(false);
-        // 保存 = 予期された心拍停止 → raw98 点検/復旧 (§9.1)
-        ctx.dxl->checkWatchdog(/*torque_may_be_on=*/false, now_s);
+        // 保存 = 予期された心拍停止 → raw98 点検/復旧 (§9.1)。復旧失敗や
+        // 復旧回数超過は握り潰さずラッチ FAULT へ
+        const hw::WatchdogCheck wc =
+            ctx.dxl->checkWatchdog(/*torque_may_be_on=*/false, now_s);
         ls.save_gate_active = false;
         ctx.shared->setSaveInProgress(false);
         ctx.shared->clearSaveRequest();
+        if (wc == hw::WatchdogCheck::Fault) {
+          raiseFault(ls, ctx, FaultReason::WatchdogRecoverRepeated, now_s);
+        }
       }
     }
 

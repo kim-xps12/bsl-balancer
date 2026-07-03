@@ -144,7 +144,7 @@ class SafetyFsm {
         if (fabsf_(in.theta) > p_.fall_threshold_rad) {
           registerFall(in.now_s);
           upright_since_valid_ = false;  // Fallen の静置検出は新規に 1.0s を要求
-          if (fall_count_ >= p_.fall_escalation_count) {
+          if (fallEscalated(in.now_s)) {
             latchFault(FaultReason::FallEscalation);
           } else {
             state_ = FsmState::Fallen;
@@ -213,13 +213,24 @@ class SafetyFsm {
     return (in.now_s - upright_since_) >= p_.upright_hold_s;
   }
 
+  // 転倒履歴はスライディング窓で数える (先頭基準のリセットだと窓を跨いだ
+  // 中間の転倒が脱落し、実際には N 回/窓 でもラッチを逃す)
   void registerFall(float now_s) {
-    // 直近 window 内の転倒回数 (小容量リングで十分)
-    if (fall_count_ > 0 && (now_s - first_fall_s_) > p_.fall_escalation_window_s) {
-      fall_count_ = 0;
+    if (fall_count_ < kMaxFallHistory) {
+      fall_ts_[fall_count_++] = now_s;
+    } else {
+      for (int i = 1; i < kMaxFallHistory; ++i) fall_ts_[i - 1] = fall_ts_[i];
+      fall_ts_[kMaxFallHistory - 1] = now_s;
     }
-    if (fall_count_ == 0) first_fall_s_ = now_s;
-    ++fall_count_;
+  }
+
+  bool fallEscalated(float now_s) const {
+    if (p_.fall_escalation_count <= 0) return false;
+    int recent = 0;
+    for (int i = 0; i < fall_count_; ++i) {
+      if ((now_s - fall_ts_[i]) <= p_.fall_escalation_window_s) ++recent;
+    }
+    return recent >= p_.fall_escalation_count;
   }
 
   void latchFault(FaultReason r) {
@@ -227,14 +238,16 @@ class SafetyFsm {
     if (fault_reason_ == FaultReason::None) fault_reason_ = r;
   }
 
+  static const int kMaxFallHistory = 8;
+
   Params p_;
   FsmState state_ = FsmState::Initializing;
   FsmAction pending_ = FsmAction::None;
   FaultReason fault_reason_ = FaultReason::None;
   bool upright_since_valid_ = false;
   float upright_since_ = 0.0f;
-  int fall_count_ = 0;
-  float first_fall_s_ = 0.0f;
+  int fall_count_ = 0;  // 履歴保持数 (kMaxFallHistory で飽和)
+  float fall_ts_[kMaxFallHistory] = {};
 };
 
 }  // namespace core

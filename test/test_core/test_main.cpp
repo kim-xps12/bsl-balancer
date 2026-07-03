@@ -455,6 +455,33 @@ static void test_fsm_fall_escalation() {
                     static_cast<int>(fsm.faultReason()));
 }
 
+static void test_fsm_fall_escalation_sliding_window() {
+  // 先頭基準リセットでは脱落するパターン (gate2 P2 回帰):
+  // 転倒 t≈2.4, 12.4, 33, 35.4 → 後ろ3件が30s窓に収まり4回目でFAULT
+  SafetyFsm fsm;
+  fsm.setParams(fsmParams());
+  fsm.notifyInitDone();
+  float now = 0.0f;
+  auto doFall = [&fsm, &now]() {
+    driveUntilArm(fsm, &now, 2.4f);
+    fsm.notifyBalancingEntered();
+    SafetyFsm::Input in = uprightInput(now += 0.005f);
+    in.theta = 0.7f;
+    fsm.update(in);
+    fsm.notifySafeStopDone();
+  };
+  doFall();          // t≈2.4
+  now += 7.6f;
+  doFall();          // t≈12.4
+  now += 18.2f;
+  doFall();          // t≈33 (先頭2.4は窓外→旧実装はここでカウント1にリセット)
+  TEST_ASSERT_EQUAL(static_cast<int>(FsmState::Fallen), static_cast<int>(fsm.state()));
+  doFall();          // t≈35.4 → (12.4, 33, 35.4) の3件が30s窓内 → FAULT
+  TEST_ASSERT_EQUAL(static_cast<int>(FsmState::Fault), static_cast<int>(fsm.state()));
+  TEST_ASSERT_EQUAL(static_cast<int>(FaultReason::FallEscalation),
+                    static_cast<int>(fsm.faultReason()));
+}
+
 static void test_fsm_stop_toggle() {
   SafetyFsm fsm;
   fsm.setParams(fsmParams());
@@ -625,6 +652,7 @@ int main(int, char**) {
   RUN_TEST(test_fsm_no_stale_upright_timer_after_fall);
   RUN_TEST(test_fsm_fall_and_recover);
   RUN_TEST(test_fsm_fall_escalation);
+  RUN_TEST(test_fsm_fall_escalation_sliding_window);
   RUN_TEST(test_fsm_stop_toggle);
   RUN_TEST(test_fsm_save_blocks_autoarm);
   RUN_TEST(test_fsm_fault_latch);
