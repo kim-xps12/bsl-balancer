@@ -187,11 +187,13 @@ bool DxlBackend::init(cfg::Profile profile) {
       }
     }
 
-    // 前回稼働の Watchdog トリップ残留を先に解除する (トリップ中は Goal 値が
-    // read-only になり零書込が失敗するため、零書込より前に行う)
+    // 前回稼働の Watchdog 状態を先に無効化する。トリップ(0xFF)中は Goal 値が
+    // read-only になるため零書込より前に解除が必要。加えて ESP32 のみ再起動
+    // した場合は武装(raw=1)のまま残り、以降の初期化トランザクションが 20ms
+    // 窓を超えるとトリップするため、非零なら一律 0 (無効) へ落とす
     uint8_t wd = 0;
     if (!readRaw(id, kAddrBusWatchdog, 1, &wd)) return false;
-    if (wd == kWatchdogTripped) {
+    if (wd != 0) {
       if (!writeRaw1(id, kAddrBusWatchdog, 0)) return false;
     }
 
@@ -441,7 +443,8 @@ void DxlBackend::pollHealth(HealthInfo* out) {
     case 3: {
       uint8_t wd = 0;
       if (readRaw(id, kAddrBusWatchdog, 1, &wd)) {
-        if (wd == kWatchdogTripped) health_.watchdog_tripped = true;
+        // 現在値で更新 (復旧後に stale なトリップ表示を残さない)
+        health_.watchdog_tripped = (wd == kWatchdogTripped);
       }
       break;
     }

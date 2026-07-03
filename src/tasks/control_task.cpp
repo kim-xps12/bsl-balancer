@@ -312,7 +312,18 @@ void controlTaskEntry(void* pvParameters) {
         ls.balance.overrideOutput(cmd_l, cmd_r);
       }
 
-      if (ctx.dxl->writeGoalCurrentsVerified(cmd_l, cmd_r)) {
+      // 未検証窓の判定は**次の非零書込より前**に行う (§4.2)。判定を書込後に
+      // 置くと、失敗が続くモードで窓超過後にもう 1 回非零を発行してしまう
+      const bool window_exceeded =
+          ls.unverified_active &&
+          static_cast<float>(now_us - ls.unverified_since_us) * 1e-6f >
+              cfg::kUnverifiedTorqueMaxS;
+      if (window_exceeded) {
+        ctx.dxl->writeZeroVerified();  // ベストエフォートの零指令
+        raiseFault(ls, ctx, FaultReason::DxlWriteUnverified, now_s);
+        ls.balance.overrideOutput(0.0f, 0.0f);
+        ls.last_cmd_l = ls.last_cmd_r = 0.0f;
+      } else if (ctx.dxl->writeGoalCurrentsVerified(cmd_l, cmd_r)) {
         ls.unverified_active = false;
         ls.last_cmd_l = cmd_l;
         ls.last_cmd_r = cmd_r;
@@ -325,11 +336,8 @@ void controlTaskEntry(void* pvParameters) {
           if (!ls.unverified_active) {
             ls.unverified_active = true;
             ls.unverified_since_us = now_us;
-          } else if (static_cast<float>(now_us - ls.unverified_since_us) * 1e-6f >
-                     cfg::kUnverifiedTorqueMaxS) {
-            // 壁時計 10ms 超 → ラッチ FAULT (§4.2)
-            raiseFault(ls, ctx, FaultReason::DxlWriteUnverified, now_s);
           }
+          // 窓超過の FAULT 判定は次周期先頭 (window_exceeded) で行う
           // 実際に送れたのは零 → スルーレート状態も零へ整合
           ls.balance.overrideOutput(0.0f, 0.0f);
           ls.last_cmd_l = ls.last_cmd_r = 0.0f;
