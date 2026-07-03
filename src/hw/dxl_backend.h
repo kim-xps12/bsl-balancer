@@ -76,8 +76,9 @@ class DxlBackend {
 
   // ---- 安全シーケンス ----
   // enter_balancing() §4.1: raw98/HWエラー確認 → 零書込検証(トルクOFFのまま)
-  // → Torque ON → 読み戻し → 零再確認。false = 検証失敗 (FSM は FAULT へ)
-  bool enterBalancing();
+  // → Torque ON → 読み戻し → 零再確認。false = 検証失敗 (FSM は FAULT へ)。
+  // トルクOFF中の潜在Watchdogトリップは §4.3 の復旧経路を先に実行する。
+  bool enterBalancing(float now_s);
   // 零書込(検証)→Torque OFF(読み戻し)。false = 未検証 → 内部で検疫を発動済み
   bool safeStop();
   // §4.3 Watchdog 状態別遷移表 (torque_may_be_on: 呼び出し側の想定)

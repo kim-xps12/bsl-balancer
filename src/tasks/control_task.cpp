@@ -268,7 +268,7 @@ void controlTaskEntry(void* pvParameters) {
 
     // FSM アクション実行
     if (fr.action == FsmAction::EnterBalancing) {
-      if (ctx.dxl->enterBalancing()) {
+      if (ctx.dxl->enterBalancing(now_s)) {
         ls.balance.reset();
         ls.plaus_l.reset();
         ls.plaus_r.reset();

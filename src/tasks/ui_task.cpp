@@ -147,13 +147,18 @@ void uiTaskEntry(void* pvParameters) {
   UiContext& ctx = *static_cast<UiContext*>(pvParameters);
   PanelState ps;
   uint8_t last_state = 0xFF;
+  shared::Snapshot sn;          // 最後に読めた正常スナップショットを保持
+  bool have_snapshot = false;   // 一度も読めていなければ保存等に使わない
   TickType_t wake = xTaskGetTickCount();
 
   for (;;) {
     M5.update();
 
-    shared::Snapshot sn;
-    ctx.shared->read(&sn);
+    shared::Snapshot tmp;
+    if (ctx.shared->read(&tmp)) {
+      sn = tmp;
+      have_snapshot = true;
+    }
 
     // BtnC 長押し = STOP/ARM トグル (利便停止 §6。ハード停止は電源スイッチ)
     if (M5.BtnC.wasHold()) ctx.shared->requestStopToggle();
@@ -181,8 +186,10 @@ void uiTaskEntry(void* pvParameters) {
     }
     last_state = sn.fsm_state;
 
-    // 保存ゲートが開いたら NVS 書込を実行して完了を報告 (§9.1)
-    if (ctx.shared->saveInProgress() && ps.pending_save != shared::SaveKind::None) {
+    // 保存ゲートが開いたら NVS 書込を実行して完了を報告 (§9.1)。
+    // 正常スナップショット未取得のまま既定値/破損値を保存しない
+    if (ctx.shared->saveInProgress() && ps.pending_save != shared::SaveKind::None &&
+        have_snapshot) {
       performSave(sn, *ctx.shared, ps);
     }
 

@@ -295,14 +295,28 @@ WheelFeedback DxlBackend::readFeedback() {
 
 // ---------------- 安全シーケンス ----------------
 
-bool DxlBackend::enterBalancing() {
-  // §4.1 enter_balancing(): 唯一の突入契約
+bool DxlBackend::enterBalancing(float now_s) {
+  // §4.1 enter_balancing(): 唯一の突入契約。
+  // トルク OFF 中の潜在トリップ (起動/校正中の心拍ギャップ等) はここで §4.3 の
+  // 安全復旧を実行してから進む — 復旧可能な状態で EntryVerifyFailed に落とさない
+  {
+    uint8_t wd0 = 0, wd1 = 0;
+    const bool r0 = readRaw(kIds[0], kAddrBusWatchdog, 1, &wd0);
+    const bool r1 = readRaw(kIds[1], kAddrBusWatchdog, 1, &wd1);
+    if (!r0 || !r1) return false;
+    if (wd0 == kWatchdogTripped || wd1 == kWatchdogTripped) {
+      if (checkWatchdog(/*torque_may_be_on=*/false, now_s) !=
+          WatchdogCheck::Recovered) {
+        return false;
+      }
+    }
+  }
   for (uint8_t id : kIds) {
     uint8_t hw_err = 0xFF;
     if (!readRaw(id, kAddrHwErrorStatus, 1, &hw_err) || hw_err != 0) return false;
     uint8_t wd = 0;
     if (!readRaw(id, kAddrBusWatchdog, 1, &wd)) return false;
-    if (wd == kWatchdogTripped) return false;  // 潜在トリップのまま Torque ON 禁止
+    if (wd == kWatchdogTripped) return false;  // 復旧後も残るなら Torque ON 禁止
     if (wd != cfg::kBusWatchdogRaw) {
       // 復旧途中失敗等で無効(0)のまま残った場合は再有効化してから進む
       // (Watchdog なしで Torque ON しない — 最終防御の欠落を許さない)
