@@ -191,8 +191,11 @@ bool DxlBackend::init(cfg::Profile profile) {
       const uint8_t z[2] = {0, 0};
       if (!verifiedWrite(id, kAddrGoalCurrent, z, 2)) return false;
     }
-
-    // Bus Watchdog 有効化 (raw 1 = 20ms)
+  }
+  // Bus Watchdog 有効化は全サーボの設定完了後にまとめて行う (片側だけ先に
+  // 武装すると残りの初期化トランザクションが 20ms 窓を超えた場合に潜在
+  // トリップする)。有効化直後から心拍 (零書込) が 5ms 周期で走る前提。
+  for (uint8_t id : kIds) {
     if (!writeRaw1(id, kAddrBusWatchdog, cfg::kBusWatchdogRaw)) return false;
   }
   // Torque は OFF のまま (Torque ON は enter_balancing() のみ §4.1)
@@ -262,6 +265,7 @@ WheelFeedback DxlBackend::readFeedback() {
     if (x.id == cfg::kDxlIdLeft) idx = 0;
     if (x.id == cfg::kDxlIdRight) idx = 1;
     if (idx < 0 || x.length < 10) return fb;  // ID 不一致/短小応答は無効 (§4.2)
+    if ((x.error & 0x7F) != 0) return fb;     // 非 ALERT エラーの応答は採用しない
     i[idx] = units::rawToCurrentA(units::le16(&x.data[0]));
     w[idx] = units::rawToVelRadS(units::le32(&x.data[2]));
     pos[idx] = units::rawToPosRad(units::le32(&x.data[6]));

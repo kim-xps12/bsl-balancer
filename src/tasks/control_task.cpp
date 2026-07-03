@@ -155,18 +155,20 @@ void controlTaskEntry(void* pvParameters) {
     const int calib_cycles =
         static_cast<int>(cfg::kGyroCalibDurationS / cfg::kControlPeriodS);
     double gyro_sum = 0.0, tilt_sum = 0.0;
-    int calib_n = 0;
+    int gyro_n = 0, accel_n = 0;
     TickType_t wake = xTaskGetTickCount();
     for (int i = 0; i < calib_cycles; ++i) {
       const core::ImuSample s = ctx.imu->sample();
-      if (s.gyro_fresh) { gyro_sum += s.gyro_rate; ++calib_n; }
-      if (s.accel_fresh) tilt_sum += std::atan2(s.acc_tilt, s.acc_vert);
+      if (s.gyro_fresh) { gyro_sum += s.gyro_rate; ++gyro_n; }
+      if (s.accel_fresh) { tilt_sum += std::atan2(s.acc_tilt, s.acc_vert); ++accel_n; }
       ctx.dxl->writeZeroHeartbeat();
       vTaskDelayUntil(&wake, pdMS_TO_TICKS(cfg::kControlPeriodMs));
     }
-    if (calib_n > calib_cycles / 2) {
-      ls.estimator.reset(static_cast<float>(tilt_sum / calib_cycles),
-                         static_cast<float>(gyro_sum / calib_n));
+    // gyro/accel それぞれの実サンプル数で平均し、どちらか不足なら InitFailed
+    // (accel 欠落を 0 傾斜として飲み込むと重力基準なしでアームしうる)
+    if (gyro_n > calib_cycles / 2 && accel_n > calib_cycles / 4) {
+      ls.estimator.reset(static_cast<float>(tilt_sum / accel_n),
+                         static_cast<float>(gyro_sum / gyro_n));
       ls.fsm.notifyInitDone();
     } else {
       raiseFault(ls, ctx, FaultReason::InitFailed, nowSeconds());  // IMU 不動
