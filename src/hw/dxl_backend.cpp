@@ -51,6 +51,9 @@ bool DxlWithRxInfo::writeVerified(uint8_t id, uint16_t addr, const uint8_t* data
   if (rx == nullptr) return false;
   if (rx->id != id) return false;       // 他 ID/残留応答の誤消費を拒否 (§4.2)
   if (rx->err_idx != 0) return false;   // ALERT(0x80) 含む非零は安全側へ
+  // WRITE の Status はパラメータ 0 バイト。前回 READ の遅延応答 (データ付き)
+  // を配達証明として誤受理しない
+  if (rx->recv_param_len != 0) return false;
   return true;
 }
 
@@ -315,16 +318,25 @@ bool DxlBackend::enterBalancing() {
 }
 
 bool DxlBackend::safeStop() {
-  // 零書込(検証) → Torque OFF(読み戻し)。未検証なら検疫 (§4.2 fail-stop)
-  bool ok = writeZeroVerified();
-  if (ok) {
-    for (uint8_t id : kIds) {
-      ok &= writeRaw1(id, kAddrTorqueEnable, 0);
-      ok &= verifyByte(id, kAddrTorqueEnable, 0);
+  // 零書込(検証) → Torque OFF(読み戻し)。**サーボ毎に独立してベストエフォート**
+  // で実行する — 片側が無応答でも健常側の Torque OFF を必ず試みる (部分故障で
+  // 応答する側を駆動されたまま放置しない)。全段検証成功のみ true、
+  // 失敗があれば検疫 (§4.2 fail-stop)。
+  bool all_ok = true;
+  for (uint8_t id : kIds) {
+    const uint8_t z[2] = {0, 0};
+    bool zero_ok = verifiedWrite(id, kAddrGoalCurrent, z, 2);
+    if (zero_ok) {
+      uint8_t v[2];
+      zero_ok = readRaw(id, kAddrGoalCurrent, 2, v) && units::le16(v) == 0;
     }
+    // 零が未検証でも Torque OFF は独立に試みる (OFF 自体が無通電化)
+    bool off_ok = writeRaw1(id, kAddrTorqueEnable, 0);
+    off_ok = off_ok && verifyByte(id, kAddrTorqueEnable, 0);
+    all_ok = all_ok && zero_ok && off_ok;
   }
-  if (!ok) engageQuarantine();
-  return ok;
+  if (!all_ok) engageQuarantine();
+  return all_ok;
 }
 
 bool DxlBackend::watchdogRecoverOne(uint8_t id) {
