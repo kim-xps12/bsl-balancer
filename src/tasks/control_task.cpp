@@ -257,7 +257,10 @@ void controlTaskEntry(void* pvParameters) {
     fi.wheel_speed_max = std::fmax(std::fabs(fb.omega_left), std::fabs(fb.omega_right));
     fi.wheel_valid = fb.valid;
     fi.stop_toggle = stop_edge;
-    fi.save_in_progress = ls.save_gate_active;
+    // 保存「要求中」もアーム経路をブロックする (§9.1)。ゲートが開く前の同一
+    // 周期で起立検出が先に通ると SAVE タップとトルク ON がレースするため。
+    fi.save_in_progress =
+        ls.save_gate_active || (ctx.shared->saveRequest() != shared::SaveKind::None);
     fi.fault = fault;
     fi.now_s = now_s;
     fi.dt = dt;
@@ -327,6 +330,8 @@ void controlTaskEntry(void* pvParameters) {
             // 壁時計 10ms 超 → ラッチ FAULT (§4.2)
             raiseFault(ls, ctx, FaultReason::DxlWriteUnverified, now_s);
           }
+          // 実際に送れたのは零 → スルーレート状態も零へ整合
+          ls.balance.overrideOutput(0.0f, 0.0f);
           ls.last_cmd_l = ls.last_cmd_r = 0.0f;
         }
       }
