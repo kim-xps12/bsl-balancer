@@ -268,6 +268,90 @@ class OutOfOrderRecoveryTests(unittest.TestCase):
         self.assertEqual(result["out_of_order_count"], 0)
 
 
+class DuplicateOfRecoveredOrProcessedPacketTests(unittest.TestCase):
+    """2026-07-06 review round 9 指摘1: a *duplicate* of a packet that has
+    already been recovered as out-of-order (or already processed in
+    ordinary forward order) can itself arrive later. By the time it
+    arrives, its seq is no longer in `missing` and it is not
+    byte-identical to the current `anchor`, so neither the anchor-duplicate
+    check nor the missing-set recovery can catch it; without the
+    `observed`-map fix, it fell through to _detect_reboot() and fabricated
+    a bogus reboot (and a bogus, non-existent reset in
+    assign_reboot_epochs())."""
+
+    def test_duplicate_of_recovered_out_of_order_packet_is_not_reboot(self):
+        # Receive order 1, 3, 2, 2: the second "2" is a duplicate of the
+        # delayed "2" that was just recovered as out-of-order.
+        builder = simulator.PacketSequenceBuilder()
+        p1 = builder.full_packet()
+        p2 = builder.full_packet()
+        p3 = builder.full_packet()
+        p2_dup = dict(p2)  # exact retransmission of the delayed seq-2 packet
+
+        records = wrap_records([p1, p3, p2, p2_dup])
+        result = analyzer.analyze_records(records)
+
+        self.assertEqual(result["reboot_count"], 0)
+        self.assertEqual([e for e in result["events"] if e["type"] == "reboot"], [])
+        self.assertEqual(result["loss"]["lost_estimate"], 0)
+        self.assertEqual(result["out_of_order_count"], 1)
+        self.assertEqual(result["duplicate_count"], 1)
+        self.assertEqual(result["variant_counts"]["full"], 3)
+
+        epochs = analyzer.assign_reboot_epochs(records)
+        self.assertEqual(epochs, [0, 0, 0, 0])
+
+    def test_duplicate_of_in_order_processed_packet_is_not_reboot(self):
+        # Receive order 1, 2, 3, 2 (dup): once `anchor` has moved on to seq
+        # 3, a delayed duplicate of the already in-order-processed seq 2 is
+        # neither an anchor-duplicate nor a `missing` recovery (seq 2 was
+        # never lost in the first place).
+        builder = simulator.PacketSequenceBuilder()
+        p1 = builder.full_packet()
+        p2 = builder.full_packet()
+        p3 = builder.full_packet()
+        p2_dup = dict(p2)
+
+        records = wrap_records([p1, p2, p3, p2_dup])
+        result = analyzer.analyze_records(records)
+
+        self.assertEqual(result["reboot_count"], 0)
+        self.assertEqual([e for e in result["events"] if e["type"] == "reboot"], [])
+        self.assertEqual(result["loss"]["lost_estimate"], 0)
+        self.assertEqual(result["out_of_order_count"], 0)
+        self.assertEqual(result["duplicate_count"], 1)
+        self.assertEqual(result["variant_counts"]["full"], 3)
+
+        epochs = analyzer.assign_reboot_epochs(records)
+        self.assertEqual(epochs, [0, 0, 0, 0])
+
+    def test_same_seq_differing_content_non_adjacent_is_still_reboot(self):
+        """Regression guard for the `observed`-map generalisation: a
+        non-adjacent record reusing an earlier-this-epoch seq value with
+        genuinely DIFFERENT content (not a byte-for-byte duplicate) must
+        still be classified as a reboot, exactly like the pre-existing
+        adjacent same-seq-differing-content rule (_detect_reboot 指摘2c)."""
+        builder = simulator.PacketSequenceBuilder()
+        p1 = builder.full_packet()  # seq 1
+        p2 = builder.full_packet()  # seq 2
+        p3 = builder.full_packet()  # seq 3
+        mutant = builder.full_packet()  # seq 4, distinct tick/t_us/loop
+        mutant["seq"] = 2  # reused seq, but NOT an exact duplicate of p2
+        self.assertNotEqual(mutant, p2)
+
+        records = wrap_records([p1, p2, p3, mutant])
+        result = analyzer.analyze_records(records)
+
+        self.assertEqual(result["reboot_count"], 1)
+        reboot_events = [e for e in result["events"] if e["type"] == "reboot"]
+        self.assertEqual(len(reboot_events), 1)
+        self.assertEqual(reboot_events[0]["seq"], 2)
+        self.assertEqual(reboot_events[0]["epoch"], 1)
+
+        epochs = analyzer.assign_reboot_epochs(records)
+        self.assertEqual(epochs, [0, 0, 0, 1])
+
+
 class RebootOpenRegionTests(unittest.TestCase):
     """指摘1: a saturation/i2t/control_task_stall region still open at the
     moment of a reboot must be closed and reported (using the pre-reboot

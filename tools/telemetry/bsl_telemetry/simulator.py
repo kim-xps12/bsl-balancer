@@ -68,6 +68,19 @@ class PacketSequenceBuilder:
         self.stale = 0
         self.read_fail = 0
         self.trunc = 0
+        # Counts reboot() calls (2026-07-06 review round 9): folded into the
+        # post-reboot `t_us` baseline below so two different boot
+        # generations of this builder never emit a byte-for-byte identical
+        # packet at the same relative seq/tick offset. Real firmware's
+        # `t_us` is microseconds since THAT boot; two independent boots
+        # reaching the exact same "time since boot" for their Nth telemetry
+        # packet is unrealistic (WiFi reconnect timing always jitters by
+        # more than this). Without this, a short, field-static test session
+        # can have its post-reboot packet(s) collide byte-for-byte with an
+        # earlier pre-reboot packet at the same seq, which is exactly the
+        # ambiguity analyzer._classify_records()'s duplicate-vs-reboot
+        # `observed`-content check cannot resolve from content alone.
+        self._reboot_count = 0
 
     def _advance_common(self) -> None:
         self.seq += 1
@@ -142,10 +155,16 @@ class PacketSequenceBuilder:
 
     def reboot(self) -> None:
         """Simulate a device restart: all counters reset near zero."""
+        self._reboot_count += 1
         self.seq = 0
         self.tick = 0
         self.loop = 0
-        self.t_us = 0
+        # Not a plain 0: see the `_reboot_count` comment in __init__. Still
+        # "near zero" (microsecond-scale) for every existing reboot-signal
+        # assertion (t_us regression / "reset near zero" checks) -- this
+        # only guarantees the post-reboot trajectory never numerically
+        # replays an earlier boot's.
+        self.t_us = self._reboot_count
         self.dt_h = [0] * 8
         self.ovr = 0
         self.stale = 0

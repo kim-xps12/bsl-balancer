@@ -198,44 +198,107 @@ def _classify_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]
     where they could otherwise coincidentally collide with a stale
     pre-reboot missing entry.
 
+    2026-07-06 review round 9 指摘1: a *duplicate* of a datagram that has
+    already been recovered as out-of-order (or already processed in
+    ordinary forward order) can itself arrive later, e.g. receive order
+    1, 3, 2, 2 -- the second "2" is a duplicate of the just-recovered
+    delayed "2". By the time it arrives, `missing` no longer contains that
+    seq (the first "2" already discarded it) and it is not byte-identical
+    to `anchor` (which has moved on to seq 3), so neither the anchor-
+    duplicate check above nor the missing-set recovery below can catch it;
+    falling through to _detect_reboot() would see seq/tick regress
+    relative to `anchor` and fabricate a bogus reboot. The same failure
+    mode hits an in-order-processed packet's delayed duplicate (e.g.
+    1, 2, 3, 2): once `anchor` is seq 3, a duplicate of seq 2 is neither an
+    anchor-duplicate nor in `missing` (it was never lost in the first
+    place). Both are resolved with a second, complementary per-epoch map:
+    `observed` remembers every seq's packet content for the lifetime of
+    the epoch (not just the immediately preceding one). A later record
+    whose seq is already in `observed`:
+      - with matching content -> a harmless duplicate: skip it (it must
+        not touch `missing`, must not become the new anchor, and -- per
+        analyze_records() -- must not pollute any statistic).
+      - with differing content -> the same "same seq, different content"
+        reboot signal as _detect_reboot()'s rule 2c above, generalised to
+        a non-adjacent record (a reboot can reuse a low seq value, e.g.
+        seq=1, that was already observed earlier this same epoch).
+    `observed` is cleared on every reboot boundary, exactly like `missing`
+    (a post-reboot seq restarting near zero must not be compared against a
+    stale pre-reboot entry). Memory: analysis is offline over one already-
+    complete session, and a uint32 seq wraparound would need >6 years of
+    continuous 20 Hz telemetry, so retaining every observed seq for an
+    epoch's lifetime is not a practical concern.
+
     Returns one dict per record, in `records` order:
       - "epoch": 0-based reboot epoch (see assign_reboot_epochs).
       - "is_reboot": True iff this record is the first post-reboot record.
       - "is_out_of_order": True iff this record was recovered as a delayed,
         merely-reordered datagram (never True at the same time as
         "is_reboot").
+      - "is_duplicate": True iff this record is a harmless repeat of a
+        datagram already accounted for (either byte-identical to `anchor`,
+        or byte-identical to an earlier-this-epoch record at the same seq)
+        and must be excluded from every downstream statistic (never True
+        at the same time as "is_reboot" or "is_out_of_order").
     """
     classifications: List[Dict[str, Any]] = []
     epoch = 0
     anchor: Optional[Dict[str, Any]] = None
     missing: set = set()
+    observed: Dict[int, Dict[str, Any]] = {}
 
     for record in records:
         packet = record["packet"]
 
         if anchor is not None and _is_exact_duplicate(anchor, packet):
-            classifications.append({"epoch": epoch, "is_reboot": False, "is_out_of_order": False})
+            classifications.append(
+                {"epoch": epoch, "is_reboot": False, "is_out_of_order": False, "is_duplicate": True}
+            )
             continue
 
         seq = packet["seq"]
+
+        if seq in observed:
+            if observed[seq] == packet:
+                classifications.append(
+                    {"epoch": epoch, "is_reboot": False, "is_out_of_order": False, "is_duplicate": True}
+                )
+                continue
+            epoch += 1
+            missing.clear()
+            observed.clear()
+            classifications.append(
+                {"epoch": epoch, "is_reboot": True, "is_out_of_order": False, "is_duplicate": False}
+            )
+            anchor = packet
+            observed[seq] = packet
+            continue
+
         forward_delta = _uint32_forward_delta(anchor["seq"], seq) if anchor is not None else None
 
         if forward_delta is None and anchor is not None and seq in missing:
             missing.discard(seq)
-            classifications.append({"epoch": epoch, "is_reboot": False, "is_out_of_order": True})
+            classifications.append(
+                {"epoch": epoch, "is_reboot": False, "is_out_of_order": True, "is_duplicate": False}
+            )
+            observed[seq] = packet
             continue
 
         is_reboot = _detect_reboot(anchor, packet)
         if is_reboot:
             epoch += 1
             missing.clear()
+            observed.clear()
         elif anchor is not None and forward_delta is not None and forward_delta > 1:
             gap_start = (anchor["seq"] + 1) % _UINT32_MOD
             for i in range(min(forward_delta - 1, _MAX_TRACKED_MISSING_PER_GAP)):
                 missing.add((gap_start + i) % _UINT32_MOD)
 
-        classifications.append({"epoch": epoch, "is_reboot": is_reboot, "is_out_of_order": False})
+        classifications.append(
+            {"epoch": epoch, "is_reboot": is_reboot, "is_out_of_order": False, "is_duplicate": False}
+        )
         anchor = packet
+        observed[seq] = packet
 
     return classifications
 
@@ -406,10 +469,10 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
     prev_seq: Optional[int] = None
     prev_t_us: Optional[int] = None
-    prev_packet: Optional[Dict[str, Any]] = None
     lost_estimate = 0
     reboot_count = 0
     out_of_order_count = 0
+    duplicate_count = 0
 
     # Full-packet-only interval trackers (dt_h/ovr/stale/loop). Reset to
     # None whenever a reboot is detected so deltas are never computed across
@@ -444,13 +507,17 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         classification = classifications[record_idx]
         epoch = classification["epoch"]
 
-        if _is_exact_duplicate(prev_packet, packet):
-            # Harmless UDP-level duplicate datagram (same seq, same
-            # everything): must not be double-counted into variant/loss/dt
-            # stats, and must not look like a stalled control loop (a
-            # loop/dt_h delta of exactly zero) or a reboot (指摘2a). Leave
-            # every baseline untouched (there is nothing new to anchor on)
-            # and move on to the next record.
+        if classification["is_duplicate"]:
+            # Harmless duplicate datagram -- either byte-identical to the
+            # immediately preceding accepted record (指摘2a), or a delayed
+            # repeat of an already-recovered/-processed record at the same
+            # seq arriving later in receive order (2026-07-06 review round
+            # 9 指摘1; see _classify_records()'s `observed` map). Either way
+            # it must not be double-counted into variant/loss/dt stats, and
+            # must not look like a stalled control loop (a loop/dt_h delta
+            # of exactly zero) or a reboot. Leave every baseline untouched
+            # (there is nothing new to anchor on) and move on.
+            duplicate_count += 1
             continue
 
         variant = "full" if packet.get("snap_valid") else "diagnostic"
@@ -543,7 +610,6 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
         prev_seq = seq
         prev_t_us = t_us
-        prev_packet = packet
 
         # dev/fw change detection happens after the reboot handling above so
         # a change observed on the very first post-reboot packet is tagged
@@ -688,6 +754,7 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "tick_seq_gap": tick_seq_gap_stats,
         "reboot_count": reboot_count,
         "out_of_order_count": out_of_order_count,
+        "duplicate_count": duplicate_count,
     }
 
 
