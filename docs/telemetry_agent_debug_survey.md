@@ -2,6 +2,8 @@
 
 調査日: 2026-06-29
 
+注記: 本調査は2026-06-29時点の旧構成（10ms loop/calcPID/PS4）を前提とする。現行 FreeRTOS 構成への適用は docs/plans/2026-07-05-udp-telemetry-phase1.md を正とする。
+
 ## 結論
 
 M5Stack Core2 から Wi-Fi/UDP で PC へテレメトリを送信し、PC 側のローカルサーバが実験ログとして蓄積し、その保存済みログを coding agent に解析させる仕組みは実現可能である。
