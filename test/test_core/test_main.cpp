@@ -1272,15 +1272,22 @@ static void test_wifi_guard_prewarm_withheld_during_arm_pending() {
   g.tick(true, 1, false, false);
   g.tick(true, 2, false, false);  // begin
 
-  // arm_pending 中に GOT_IP (Connected 遷移) が来ても prewarm は保留される
+  // arm_pending 中に GOT_IP (Connected 遷移) が drain された場合、quiet 窓中に
+  // 成立した接続として有界キャンセルされ、prewarm も発生しない
+  // (ゲート2レビュー(4回目)指摘1 で「接続維持+prewarm保留」から abort へ仕様変更)
   g.pushEvent(WifiGuard::EventKind::GotIp);
   g.tick(true, 3, false, /*arm_pending=*/true);
-  TEST_ASSERT_TRUE(g.connected());
+  TEST_ASSERT_TRUE(g.aborting());
   TEST_ASSERT_FALSE(g.readyToAttempt());
   TEST_ASSERT_EQUAL(0, st.begin_packet_calls);
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);
 
-  // arm_pending 解消 → prewarm 許可
-  g.tick(true, 4, false, false);
+  // abort 確認 → arm_pending 解消 → 再接続 → prewarm 許可
+  g.pushEvent(WifiGuard::EventKind::StaDisconnected, WifiGuard::kReasonAssocLeave);
+  g.tick(true, 4, false, false);  // abort 完了 + begin 再発行
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 5, false, false);  // !quiet で接続成立 → abort されない
+  TEST_ASSERT_FALSE(g.aborting());
   TEST_ASSERT_TRUE(g.readyToAttempt());
 }
 
@@ -1334,18 +1341,56 @@ static void test_wifi_guard_disconnect_clears_udp_ready_blocks_quiet_send_after_
   TEST_ASSERT_FALSE(g.udpReady());
 
   // 再接続完了が WIFI_QUIET (Balancing) 中に drain されるケース:
-  // 修正前は stale な udp_ready_ により readyToAttempt() が true になっていた
+  // stale な udp_ready_ で readyToAttempt() が true になってはならず (3回目指摘)、
+  // さらに quiet 窓中に成立した接続は有界キャンセルされる (4回目指摘)
   g.pushEvent(WifiGuard::EventKind::GotIp);
   g.tick(true, 5, /*balancing=*/true, false);
-  TEST_ASSERT_TRUE(g.connected());
-  TEST_ASSERT_FALSE(g.readyToAttempt());  // quiet 窓では prewarm を保留
+  TEST_ASSERT_FALSE(g.readyToAttempt());  // quiet 窓では送信不可
+  TEST_ASSERT_TRUE(g.aborting());         // quiet 窓中に成立した接続は abort
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);
 
-  // !WIFI_QUIET に戻ったら prewarm が許可される
-  g.tick(true, 6, false, false);
+  // abort 確認 → !WIFI_QUIET に戻ったら再接続 → prewarm が許可される
+  g.pushEvent(WifiGuard::EventKind::StaDisconnected, WifiGuard::kReasonAssocLeave);
+  g.tick(true, 6, false, false);  // abort 完了 + begin 再発行
+  TEST_ASSERT_FALSE(g.aborting());
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 7, false, false);  // !quiet で接続成立 → abort されない
+  TEST_ASSERT_FALSE(g.aborting());
   TEST_ASSERT_TRUE(g.readyToAttempt());
+  TEST_ASSERT_FALSE(g.udpReady());  // 切断で reset 済み → 要 prewarm
   TEST_ASSERT_EQUAL(static_cast<int>(WifiGuard::SendOutcome::Sent),
                     static_cast<int>(g.trySend(payload, sizeof(payload))));
   TEST_ASSERT_TRUE(g.udpReady());
+}
+
+// !quiet 中に正規発行した begin() が tick 間に完了し、次 tick では既に
+// arm_pending/Balancing (WIFI_QUIET) になっているケース: GotIp ハンドラが
+// connecting_ をクリアするためラッチなしでは abort がスキップされる
+// (ゲート2レビュー(4回目)指摘1・P1 対応)
+static void test_wifi_guard_own_begin_completes_during_quiet_aborts_once() {
+  FakeWifiState st;
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  WifiGuard g(makeFakeOps(&st), p);
+
+  g.tick(true, 1, false, false);
+  g.tick(true, 2, false, false);  // !quiet で正規の begin 発行
+  TEST_ASSERT_EQUAL(1, st.begin_calls);
+  TEST_ASSERT_TRUE(g.connecting());
+
+  // tick 間に接続が完了し、次 tick では既に arm_pending (WIFI_QUIET)
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 3, false, /*arm_pending=*/true);
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);  // 有界キャンセルが発火
+  TEST_ASSERT_TRUE(g.aborting());
+  TEST_ASSERT_FALSE(g.readyToAttempt());
+
+  // abort 確認 → 完了。quiet が続く限り begin は再発行されない
+  g.pushEvent(WifiGuard::EventKind::StaDisconnected, WifiGuard::kReasonAssocLeave);
+  g.tick(true, 4, false, true);
+  TEST_ASSERT_FALSE(g.aborting());
+  TEST_ASSERT_EQUAL(1, st.begin_calls);
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);
 }
 
 // ---------------- 統合: armPending() が Wi-Fi 接続を Balancing 前に abort する ----------------
@@ -1522,6 +1567,7 @@ int main(int, char**) {
   RUN_TEST(test_wifi_guard_prewarm_withheld_during_arm_pending);
   RUN_TEST(test_wifi_guard_endpacket_failure_keeps_udp_ready_during_balancing);
   RUN_TEST(test_wifi_guard_disconnect_clears_udp_ready_blocks_quiet_send_after_reconnect);
+  RUN_TEST(test_wifi_guard_own_begin_completes_during_quiet_aborts_once);
   RUN_TEST(test_integration_wifi_abort_before_balancing_auto_arm);
   RUN_TEST(test_integration_wifi_abort_before_balancing_manual_arm);
   RUN_TEST(test_shared_state_concurrent_publish_read_no_torn_read);
