@@ -1205,6 +1205,77 @@ static void test_wifi_guard_delayed_got_ip_during_abort_blocks_send() {
   TEST_ASSERT_EQUAL(1, st.begin_packet_calls);  // 直前の成功送信の1回のみ (再試行なし)
 }
 
+// ---------------- WifiGuard: abort 完了と同一 drain 内のラッチ残留
+// (2026-07-06 ゲート2レビュー(8回目)指摘2) ----------------
+// abort 進行中に、遅延 GOT_IP (one-shot 再接続の完了) と post-abort の
+// STA_DISCONNECTED(ASSOC_LEAVE) (abort 自身の完了確認) が同一 tick の
+// drainEvents() 内で両方消化されると: GotIp ハンドラが
+// connection_established_in_drain_ ラッチを立てた直後に、StaDisconnected
+// ハンドラが completeAbort() を呼んで abort 自体は完了する
+// (aborting_==false, connected_==false)。ラッチだけを見て abort する旧実装
+// では、この完了済み (かつ既に切断済みの) 接続へ二度目の startAbort() が
+// 発行されてしまい、対応する ASSOC_LEAVE は二度と来ないため確認 tick を
+// 消費してリトライへ進む。修正後はラッチ条件に connected_ (drain 終了時点
+// で接続が生存しているか) を追加し、この場合は取り消す対象がないとして
+// 二度目の abort を発行しない。
+static void test_wifi_guard_abort_completes_same_drain_as_delayed_got_ip_no_second_abort() {
+  FakeWifiState st;
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  p.abort_confirm_ticks = 3;
+  p.abort_max_retries = 3;
+  WifiGuard g(makeFakeOps(&st), p);
+
+  // 通常接続を確立する。
+  g.tick(true, 1, false, false);
+  g.tick(true, 2, false, false);  // begin -> connecting_
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 3, false, false);
+  TEST_ASSERT_TRUE(g.connected());
+
+  // AP を一時喪失 (非自発的切断) -> ライブラリ one-shot 再接続が in-flight
+  // になり (lib_reconnect_pending_)、同一 tick で Balancing (quiet) へ遷移
+  // させて abort を開始させる (test_wifi_guard_delayed_got_ip_during_abort_
+  // blocks_send と同じ土台)。
+  g.pushEvent(WifiGuard::EventKind::StaDisconnected, /*reason=*/1);
+  g.tick(true, 4, /*balancing=*/true, false);
+  TEST_ASSERT_TRUE(g.aborting());
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);
+  TEST_ASSERT_FALSE(g.connected());
+
+  // 確認 (ASSOC_LEAVE) 未到着のうちに、in-flight だった one-shot の遅延
+  // GOT_IP と、abort 自身の完了確認 (ASSOC_LEAVE) が同一 tick の drain 内
+  // に両方キューされる (レース: one-shot が実は成功していた直後に、abort
+  // で発行した disconnect() の確認も同じ 50ms 窓に届いた場合)。
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.pushEvent(WifiGuard::EventKind::StaDisconnected, WifiGuard::kReasonAssocLeave);
+  g.tick(true, 5, /*balancing=*/true, false);
+
+  // abort は (StaDisconnected の completeAbort() により) この1 tick で完了
+  // していなければならない。ラッチ (connection_established_in_drain) だけ
+  // を見る旧実装では、GotIp が立てたラッチが completeAbort() 後も残り、
+  // connected_==false なのに quiet && ラッチ で二度目の startAbort() が
+  // 発行されて aborting() が再び true に戻ってしまう (このテストは修正
+  // なしでは失敗する: 逆検証済み)。
+  TEST_ASSERT_FALSE(g.aborting());
+  TEST_ASSERT_FALSE(g.connected());
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);  // 追加の disconnect は発行されない
+  TEST_ASSERT_FALSE(g.radioOffPending());
+  TEST_ASSERT_FALSE(g.wifiAbortFailed());
+
+  // 後続の tick でも (新しいイベントがない限り) 状態は安定したまま:
+  // 二度目の abort が発行されていれば、確認イベントが二度と来ないため
+  // リトライを重ねて radio-off/latch まで進んでしまうはずだが、修正後は
+  // 何も起きない。
+  for (uint32_t t = 6; t < 6 + (p.abort_confirm_ticks * (p.abort_max_retries + 1)); ++t) {
+    g.tick(true, t, /*balancing=*/true, false);
+  }
+  TEST_ASSERT_FALSE(g.aborting());
+  TEST_ASSERT_FALSE(g.radioOffPending());
+  TEST_ASSERT_FALSE(g.wifiAbortFailed());
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);
+}
+
 static void test_wifi_guard_delayed_got_ip_during_radio_off_pending_blocks_send() {
   FakeWifiState st;
   st.disconnect_return = false;  // disconnect() を常に失敗させ、retry 上限到達を強制する
@@ -1612,6 +1683,7 @@ int main(int, char**) {
   RUN_TEST(test_wifi_guard_lib_reconnect_completes_same_tick_during_arm_pending_aborts_once);
   RUN_TEST(test_wifi_guard_lib_reconnect_completes_same_tick_not_quiet_keeps_connection);
   RUN_TEST(test_wifi_guard_delayed_got_ip_during_abort_blocks_send);
+  RUN_TEST(test_wifi_guard_abort_completes_same_drain_as_delayed_got_ip_no_second_abort);
   RUN_TEST(test_wifi_guard_delayed_got_ip_during_radio_off_pending_blocks_send);
   RUN_TEST(test_wifi_guard_prewarm_beginpacket_failure_blocks_write);
   RUN_TEST(test_wifi_guard_prewarm_withheld_during_arm_pending);

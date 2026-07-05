@@ -196,15 +196,29 @@ class WifiGuard {
 
     // CONNECTING 中の fail-closed は abort 方向、かつ lib_reconnect_pending
     // (ライブラリ one-shot 再接続 in-flight) も同一機構で中断する (計画書 §3.1)。
-    // ラッチ (connection_established_in_drain) も同じ OR 条件に含める:
+    // ラッチ (connection_established_in_drain) も同じ OR 条件に含めるが、
+    // その項だけは追加で connected_ (drain 終了時点で接続が生存しているか)
+    // も要求する:
     // quiet 窓中の tick 間に接続が完了 (GOT_IP) すると、ここに来た時点では
     // connecting_/lib_reconnect_pending_ は既に GotIp ハンドラでクリアされて
     // いるため、ラッチなしでは有界キャンセルが丸ごとスキップされてしまう
     // (自前 begin: ゲート2レビュー(4回目)指摘1 / lib one-shot: 同(2回目)指摘1)。
     // quiet 窓中に成立した接続は有界キャンセルの意味論どおり切断する。
+    // ただし abort 進行中に、遅延 GOT_IP (one-shot 再接続の完了) と
+    // post-abort の STA_DISCONNECTED(ASSOC_LEAVE) が同一 drain 内で両方
+    // 消化されると、GotIp ハンドラがラッチを立てた直後に StaDisconnected
+    // ハンドラが completeAbort() を呼んで abort 自体は完了する
+    // (connected_ == false) が、ラッチは drain 終了時点でも true のまま
+    // 残る。この状態で connected_ を見ずにラッチだけで startAbort() を
+    // 発行すると、既に (abort 完了により) 切断済みの radio へ二度目の
+    // abort を発行することになり、対応する完了確認イベントは二度と来ない
+    // ためリトライを使い果たして WIFI_OFF 終端 + telemetry 不要ラッチに
+    // 迷い込む (2026-07-06 ゲート2レビュー(8回目)指摘2)。drain 終了時点で
+    // connected_ が false ならその接続は (abort 完了または切断によって)
+    // 既に消えており取り消す対象がないので、ラッチは無視してよい。
     // !quiet の場合はラッチを消費しても abort しない (上で既にリセット済み
     // なので次 tick へ誤って持ち越されることもない)。
-    if (quiet && (connecting_ || lib_reconnect_pending_ || connection_established_in_drain)) {
+    if (quiet && (connecting_ || lib_reconnect_pending_ || (connection_established_in_drain && connected_))) {
       startAbort();
       return;
     }

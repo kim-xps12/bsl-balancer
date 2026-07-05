@@ -168,6 +168,106 @@ class RebootReanchorTests(unittest.TestCase):
         self.assertEqual(epochs, [0, 1])
 
 
+class OutOfOrderRecoveryTests(unittest.TestCase):
+    """2026-07-06 review 指摘1: raw.jsonl is in *receive* order, so ordinary
+    UDP reordering (a delayed datagram arriving after a later one) must be
+    recovered as out-of-order rather than misclassified as a reboot, and
+    must not permanently inflate the loss estimate once the delayed
+    datagram actually arrives."""
+
+    def test_delayed_packet_recovered_not_reboot_and_not_counted_as_loss(self):
+        # seq 1, 3, 2 (2 delayed): classic UDP reordering, nothing lost.
+        builder = simulator.PacketSequenceBuilder()
+        p1 = builder.full_packet()
+        p2 = builder.full_packet()
+        p3 = builder.full_packet()
+        records = wrap_records([p1, p3, p2])
+
+        result = analyzer.analyze_records(records)
+        self.assertEqual(result["reboot_count"], 0)
+        self.assertEqual([e for e in result["events"] if e["type"] == "reboot"], [])
+        self.assertEqual(result["loss"]["lost_estimate"], 0)
+        self.assertEqual(result["out_of_order_count"], 1)
+        # The gap detected when seq 3 arrived (before seq 2 caught up) is
+        # still reported as an informational window -- it really was
+        # reordered, even though it turned out not to be lost -- but it
+        # must not leave the final aggregate loss count inflated.
+        self.assertEqual(result["loss"]["gap_count"], 1)
+        self.assertEqual(result["variant_counts"]["full"], 3)
+
+        epochs = analyzer.assign_reboot_epochs(records)
+        self.assertEqual(epochs, [0, 0, 0])
+
+    def test_permanent_gap_survives_alongside_unrelated_recovery(self):
+        builder = simulator.PacketSequenceBuilder()
+        p1 = builder.full_packet()  # seq 1
+        builder.full_packet()  # seq 2: never arrives (permanent loss)
+        p3 = builder.full_packet()  # seq 3
+        p4 = builder.full_packet()  # seq 4: arrives late (recovered)
+        p5 = builder.full_packet()  # seq 5
+
+        # Arrival order: 1, 3, 5, 4 (4 delayed and recovered; 2 never shows).
+        records = wrap_records([p1, p3, p5, p4])
+        result = analyzer.analyze_records(records)
+
+        self.assertEqual(result["reboot_count"], 0)
+        self.assertEqual(result["out_of_order_count"], 1)
+        # Only seq 2 remains unexplained: the delayed seq 4 must not mask it.
+        self.assertEqual(result["loss"]["lost_estimate"], 1)
+        loss_events = [e for e in result["events"] if e["type"] == "loss"]
+        self.assertEqual(len(loss_events), 2)  # one gap noticed at seq 3, one at seq 5
+
+    def test_out_of_order_recovery_does_not_pollute_interval_trackers(self):
+        """The recovered (delayed) packet must not be used to compute
+        dt_h/ovr/stale/loop interval deltas or become the new baseline --
+        otherwise the *next* legitimately-ordered packet's delta would be
+        computed against the wrong (smaller-seq) anchor."""
+        builder = simulator.PacketSequenceBuilder(samples_per_packet=10)
+        p1 = builder.full_packet()
+        p2 = builder.full_packet()
+        p3 = builder.full_packet()
+        p4 = builder.full_packet()
+
+        records = wrap_records([p1, p3, p2, p4])
+        result = analyzer.analyze_records(records)
+
+        self.assertEqual(result["reboot_count"], 0)
+        self.assertEqual(result["out_of_order_count"], 1)
+        # Intervals: 1->3 (delta 2, valid forward jump) and 3->4 (p2 is
+        # skipped for interval purposes, and does not become the anchor).
+        self.assertEqual(result["dt_histogram"]["intervals"], 2)
+
+    def test_missing_set_cleared_on_reboot_prevents_false_recovery(self):
+        """A gap left unexplained right before a reboot must not be
+        "recovered" by a coincidentally-matching post-reboot seq -- the
+        missing-seq set is per-epoch and must not survive a reboot
+        boundary."""
+        builder = simulator.PacketSequenceBuilder()
+        p1 = builder.full_packet()  # seq 1
+        builder.full_packet()  # seq 2: dropped, gap never explained pre-reboot
+        p3 = builder.full_packet()  # seq 3
+
+        builder.reboot()
+        post1 = builder.full_packet()  # seq 1 again (post-reboot)
+        post2 = builder.full_packet()  # seq 2 again (post-reboot, normal forward progress)
+
+        records = wrap_records([p1, p3, post1, post2])
+        result = analyzer.analyze_records(records)
+
+        self.assertEqual(result["reboot_count"], 1)
+        self.assertEqual(result["out_of_order_count"], 0)
+        # The pre-reboot gap (seq 2) is never explained and stays lost.
+        self.assertEqual(result["loss"]["lost_estimate"], 1)
+
+    def test_existing_reboot_scenarios_unaffected_by_out_of_order_handling(self):
+        """指摘1 regression guard: the reboot scenarios covered elsewhere in
+        this file must keep reporting zero out-of-order packets."""
+        packets = simulator.generate_scenario("reboot", count=10)
+        result = analyzer.analyze_records(wrap_records(packets))
+        self.assertEqual(result["reboot_count"], 1)
+        self.assertEqual(result["out_of_order_count"], 0)
+
+
 class RebootOpenRegionTests(unittest.TestCase):
     """指摘1: a saturation/i2t/control_task_stall region still open at the
     moment of a reboot must be closed and reported (using the pre-reboot
