@@ -122,4 +122,15 @@ constexpr float currentLimitFor(Profile p) {
   return p == Profile::Bringup ? kCurrentLimitBringupA : kCurrentLimitNormalA;
 }
 
+// ---- UDP テレメトリ (Phase1 追加。docs/plans/2026-07-05-udp-telemetry-phase1.md §3.1) ----
+constexpr uint32_t kTelemetryPeriodMs = 50;  // 20 Hz。core1 / priority1 / stack8192
+// Wi-Fi guard の abort 完了確認 (計画書 §3.1: 目安 3 tick = 150ms @50ms周期)
+constexpr uint32_t kWifiAbortConfirmTicks = 3;
+constexpr int      kWifiAbortMaxRetries = 3;      // 計画書 §3.1: 有界リトライ最大3回
+// lib_reconnect_pending フォールバック タイムアウト (計画書 §3.1: 目安15s) の tick 換算
+constexpr uint32_t kWifiLibReconnectTimeoutTicks = 300;
+// 接続失敗後の再 begin() までの猶予 (busy loop 防止。計画書は具体秒数未規定のため
+// 保守側の安全なデフォルトとして採用。TUNE)
+constexpr uint32_t kWifiReconnectBackoffTicks = 60;  // 3s @50ms
+
 }  // namespace cfg

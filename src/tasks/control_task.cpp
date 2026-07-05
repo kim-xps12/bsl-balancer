@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <cmath>
 
+#include "../core/dt_histogram.h"
 #include "../core/units.h"
 
 namespace tasks {
@@ -44,6 +45,13 @@ struct LoopState {
   float dt_max = 0.0f;
   int overrun_count = 0;
   int read_stale_count = 0;
+  // UDP telemetry Phase1 追加 (計画書 §3.1): 新設の monotonic 専用カウンタ。
+  // 上記 overrun_count/read_stale_count (連続回数・リセットあり) とは別物であり
+  // 流用しない。リセット経路を持たない累積総回数として ControlTask 内で保持し、
+  // 毎周期 Snapshot へ転記する。
+  uint32_t dt_hist_total[8] = {};
+  uint32_t overrun_total = 0;
+  uint32_t imu_stale_total = 0;
   // 未検証トルク窓 (壁時計 §4.2)
   bool unverified_active = false;
   int64_t unverified_since_us = 0;
@@ -188,6 +196,10 @@ void controlTaskEntry(void* pvParameters) {
     const float now_s = static_cast<float>(now_us) * 1e-6f;
     ++ls.loop_count;
     if (dt > ls.dt_max) ls.dt_max = dt;
+    // UDP telemetry Phase1 (計画書 §3.1): 累積 dt ヒストグラム + overrun_total は
+    // 制御則・FAULT 判定に一切関与しない観測性追加のみ (毎周期・無条件に更新)。
+    ++ls.dt_hist_total[core::classifyDtBin(dt, cfg::kControlPeriodS)];
+    if (core::isOverrunDt(dt, cfg::kControlPeriodS)) ++ls.overrun_total;
 
     FaultReason fault = FaultReason::None;
 
@@ -204,6 +216,7 @@ void controlTaskEntry(void* pvParameters) {
     // IMU (§5.2): stale 連続で FAULT
     const core::ImuSample imu = ctx.imu->sample();
     ls.estimator.update(imu, dt);
+    if (!imu.gyro_fresh) ++ls.imu_stale_total;  // telemetry 用累積総回数 (計画書 §3.1)
     if (ctx.imu->gyroStaleCount() >= cfg::kImuStaleFaultCycles) {
       fault = FaultReason::ImuStale;
     }
@@ -397,7 +410,7 @@ void controlTaskEntry(void* pvParameters) {
       }
     }
 
-    // スナップショット発行 (seqlock)
+    // スナップショット発行 (critical section 保護。§3.1)
     shared::Snapshot sn;
     sn.fsm_state = static_cast<uint8_t>(ls.fsm.state());
     sn.fault_reason = static_cast<uint8_t>(ls.fsm.faultReason());
@@ -421,6 +434,11 @@ void controlTaskEntry(void* pvParameters) {
     sn.saturated = out.saturated;
     sn.i2t_limited = out.i2t_limited;
     sn.params = ls.params;
+    // UDP telemetry Phase1 追加 (計画書 §3.1): additive のみ・制御則に影響しない
+    for (int i = 0; i < core::kDtHistogramBins; ++i) sn.dt_hist_total[i] = ls.dt_hist_total[i];
+    sn.overrun_total = ls.overrun_total;
+    sn.imu_stale_total = ls.imu_stale_total;
+    sn.arm_pending = ls.fsm.armPending();
     ctx.shared->publish(sn);
   }
 }

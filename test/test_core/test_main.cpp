@@ -2,14 +2,22 @@
 // 実行: ~/.platformio/penv/bin/pio test -e native
 // 注: Unity は math ヘッダ未取込時に isnan/isinf をマクロ定義し libc++ の
 // <cmath> を壊すため、C++ ヘッダを unity.h より先に include する。
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstring>
+#include <thread>
 
 #include "../../src/core/attitude_estimator.h"
 #include "../../src/core/balance_core.h"
+#include "../../src/core/dt_histogram.h"
 #include "../../src/core/param_validation.h"
 #include "../../src/core/pid.h"
 #include "../../src/core/safety_fsm.h"
+#include "../../src/core/telemetry_format.h"
 #include "../../src/core/units.h"
+#include "../../src/core/wifi_guard.h"
+#include "../../src/shared/shared_state.h"
 
 #include <unity.h>
 
@@ -17,6 +25,64 @@ using namespace core;
 
 void setUp() {}
 void tearDown() {}
+
+// ---------------- UDP telemetry Phase1: WifiGuard 用フェイク Ops ----------------
+// (計画書 §3.1 「インターフェース注入で Arduino API を抽象化」に対応するテストダブル)
+
+namespace {
+
+struct FakeWifiState {
+  int begin_calls = 0;
+  int disconnect_calls = 0;
+  bool disconnect_return = true;
+  int set_radio_off_calls = 0;
+  bool radio_off_status = false;
+  int begin_packet_calls = 0;
+  int begin_packet_return = 1;  // 1 = 成功
+  int write_calls = 0;
+  int write_return = -1;  // -1 の場合は呼び出し時の len をそのまま返す (成功扱い)
+  int end_packet_calls = 0;
+  int end_packet_return = 1;  // 1 = 成功
+};
+
+void FakeBegin(void* ctx) { ++static_cast<FakeWifiState*>(ctx)->begin_calls; }
+bool FakeDisconnect(void* ctx) {
+  auto* s = static_cast<FakeWifiState*>(ctx);
+  ++s->disconnect_calls;
+  return s->disconnect_return;
+}
+void FakeSetRadioOff(void* ctx) { ++static_cast<FakeWifiState*>(ctx)->set_radio_off_calls; }
+bool FakeIsRadioOff(void* ctx) { return static_cast<FakeWifiState*>(ctx)->radio_off_status; }
+int FakeBeginPacket(void* ctx) {
+  auto* s = static_cast<FakeWifiState*>(ctx);
+  ++s->begin_packet_calls;
+  return s->begin_packet_return;
+}
+int FakeWritePacket(void* ctx, const uint8_t*, size_t len) {
+  auto* s = static_cast<FakeWifiState*>(ctx);
+  ++s->write_calls;
+  return s->write_return < 0 ? static_cast<int>(len) : s->write_return;
+}
+int FakeEndPacket(void* ctx) {
+  auto* s = static_cast<FakeWifiState*>(ctx);
+  ++s->end_packet_calls;
+  return s->end_packet_return;
+}
+
+WifiOps makeFakeOps(FakeWifiState* s) {
+  WifiOps o;
+  o.ctx = s;
+  o.begin = &FakeBegin;
+  o.disconnect = &FakeDisconnect;
+  o.setRadioOff = &FakeSetRadioOff;
+  o.isRadioOff = &FakeIsRadioOff;
+  o.beginPacket = &FakeBeginPacket;
+  o.writePacket = &FakeWritePacket;
+  o.endPacket = &FakeEndPacket;
+  return o;
+}
+
+}  // namespace
 
 // ---------------- units (§19.1 単位変換試験) ----------------
 
@@ -624,6 +690,587 @@ static void test_commissioning_fail_closed() {
   TEST_ASSERT_FALSE(validateCommissioning(rec, csum, 3));
 }
 
+// ---------------- SafetyFsm::armPending() (UDP telemetry Phase1 計画書 §3.1) ----------------
+
+static void test_fsm_arm_pending_auto_arm() {
+  SafetyFsm fsm;
+  fsm.setParams(fsmParams(true, true));  // commissioned + auto_arm → Idle
+  fsm.notifyInitDone();
+  TEST_ASSERT_EQUAL(static_cast<int>(FsmState::Idle), static_cast<int>(fsm.state()));
+  TEST_ASSERT_FALSE(fsm.armPending());  // 起立確認前はまだ保留していない
+
+  float now = 0.0f;
+  bool became_pending = false;
+  bool requested = false;
+  for (int i = 0; i < 260; ++i) {
+    now += 0.005f;
+    const SafetyFsm::Result r = fsm.update(uprightInput(now));
+    if (fsm.armPending()) became_pending = true;
+    if (r.action == FsmAction::EnterBalancing) { requested = true; break; }
+  }
+  TEST_ASSERT_TRUE(became_pending);
+  TEST_ASSERT_TRUE(requested);
+  TEST_ASSERT_TRUE(fsm.armPending());  // EnterBalancing 発行直後もまだ Idle のまま
+
+  fsm.notifyBalancingEntered();
+  TEST_ASSERT_FALSE(fsm.armPending());  // Balancing 遷移後は解除
+}
+
+static void test_fsm_arm_pending_manual_arm() {
+  SafetyFsm fsm;
+  fsm.setParams(fsmParams(false, true));  // 未コミッショニング → Disarmed 起動
+  fsm.notifyInitDone();
+  TEST_ASSERT_EQUAL(static_cast<int>(FsmState::Disarmed), static_cast<int>(fsm.state()));
+  TEST_ASSERT_FALSE(fsm.armPending());
+
+  float now = 0.0f;
+  SafetyFsm::Input in = uprightInput(now += 0.005f);
+  in.stop_toggle = true;  // BtnC 手動アーム → Idle
+  fsm.update(in);
+  TEST_ASSERT_EQUAL(static_cast<int>(FsmState::Idle), static_cast<int>(fsm.state()));
+
+  bool became_pending = false;
+  bool requested = false;
+  for (int i = 0; i < 260; ++i) {
+    now += 0.005f;
+    const SafetyFsm::Result r = fsm.update(uprightInput(now));
+    if (fsm.armPending()) became_pending = true;
+    if (r.action == FsmAction::EnterBalancing) { requested = true; break; }
+  }
+  TEST_ASSERT_TRUE(became_pending);
+  TEST_ASSERT_TRUE(requested);
+  fsm.notifyBalancingEntered();
+  TEST_ASSERT_FALSE(fsm.armPending());
+}
+
+// ---------------- dt_histogram (計画書 §3.1) ----------------
+
+static void test_dt_histogram_boundaries() {
+  const float period = 0.005f;
+  TEST_ASSERT_EQUAL(0, classifyDtBin(period * 1.000f, period));
+  TEST_ASSERT_EQUAL(0, classifyDtBin(period * 1.019f, period));
+  TEST_ASSERT_EQUAL(1, classifyDtBin(period * 1.020f, period));
+  TEST_ASSERT_EQUAL(1, classifyDtBin(period * 1.049f, period));
+  TEST_ASSERT_EQUAL(2, classifyDtBin(period * 1.050f, period));
+  TEST_ASSERT_EQUAL(2, classifyDtBin(period * 1.099f, period));
+  TEST_ASSERT_EQUAL(3, classifyDtBin(period * 1.100f, period));
+  TEST_ASSERT_EQUAL(3, classifyDtBin(period * 1.199f, period));
+  TEST_ASSERT_EQUAL(4, classifyDtBin(period * 1.200f, period));
+  TEST_ASSERT_EQUAL(4, classifyDtBin(period * 1.299f, period));
+  TEST_ASSERT_EQUAL(5, classifyDtBin(period * 1.300f, period));
+  TEST_ASSERT_EQUAL(5, classifyDtBin(period * 1.499f, period));
+  TEST_ASSERT_EQUAL(6, classifyDtBin(period * 1.500f, period));
+  TEST_ASSERT_EQUAL(6, classifyDtBin(period * 1.999f, period));
+  TEST_ASSERT_EQUAL(7, classifyDtBin(period * 2.000f, period));
+  TEST_ASSERT_EQUAL(7, classifyDtBin(period * 5.000f, period));
+
+  TEST_ASSERT_FALSE(isOverrunDt(period * 1.5f, period));
+  TEST_ASSERT_TRUE(isOverrunDt(period * 1.5f + 1e-6f, period));
+}
+
+static void test_dt_monotonic_counter_survives_consecutive_reset() {
+  // 既存 LoopState.overrun_count (連続回数、正常サイクルでリセット) を模した挙動と
+  // 新設 overrun_total (monotonic、リセット経路なし) を対比する (ゲート1第2回指摘)。
+  const float period = 0.005f;
+  int consecutive = 0;
+  uint32_t total = 0;
+  const float dts[] = {period * 2.0f, period * 1.0f, period * 2.0f,
+                       period * 1.0f, period * 2.0f, period * 1.0f};
+  for (float dt : dts) {
+    if (isOverrunDt(dt, period)) {
+      ++consecutive;
+      ++total;
+    } else {
+      consecutive = 0;  // 連続カウンタは正常サイクルでリセット (既存 LoopState と同じ)
+    }
+  }
+  TEST_ASSERT_EQUAL_UINT32(3, total);  // monotonic 側は 3 回の overrun を漏れなく検出
+  TEST_ASSERT_EQUAL(0, consecutive);   // 連続カウンタは最後の正常サイクルでリセット済み
+}
+
+// ---------------- telemetry_format (計画書 §3.1) ----------------
+
+static void test_telemetry_format_full_and_diag_success() {
+  char buf[kTelemetryBufferBytes];
+
+  TelemetryDiagFields df;
+  df.seq = 5;
+  df.tick = 6;
+  df.t_us = 123;
+  df.dev = "core2-aaaa";
+  df.fw = "abc123";
+  df.reason = DiagReason::ReadFail;
+  df.read_fail = 2;
+  df.trunc = 0;
+  const size_t n = formatDiagPacket(buf, sizeof(buf), df);
+  TEST_ASSERT_TRUE(n > 0);
+  TEST_ASSERT_TRUE(n < kTelemetryBufferBytes);
+  TEST_ASSERT_NOT_NULL(strstr(buf, "\"snap_valid\":false"));
+  TEST_ASSERT_NOT_NULL(strstr(buf, "\"reason\":\"read_fail\""));
+
+  TelemetryFullFields ff;
+  ff.seq = 1;
+  ff.tick = 1;
+  ff.t_us = 1;
+  ff.dev = "core2-aaaa";
+  ff.fw = "abc123";
+  const size_t n2 = formatFullPacket(buf, sizeof(buf), ff);
+  TEST_ASSERT_TRUE(n2 > 0);
+  TEST_ASSERT_TRUE(n2 < kTelemetryBufferBytes);
+  TEST_ASSERT_NOT_NULL(strstr(buf, "\"snap_valid\":true"));
+  TEST_ASSERT_NOT_NULL(strstr(buf, "\"v\":1"));
+}
+
+static void test_telemetry_format_truncation_forced() {
+  // バッファを意図的に極小にして truncation を強制する (計画書 §3.1)。
+  TelemetryFullFields f;
+  f.dev = "core2-aaaa";
+  f.fw = "deadbeef";
+  char buf[16];
+  const size_t n = formatFullPacket(buf, sizeof(buf), f);
+  TEST_ASSERT_EQUAL_UINT32(0u, static_cast<uint32_t>(n));
+
+  TelemetryDiagFields df;
+  df.dev = "core2-aaaa";
+  df.fw = "deadbeef";
+  const size_t n2 = formatDiagPacket(buf, sizeof(buf), df);
+  TEST_ASSERT_EQUAL_UINT32(0u, static_cast<uint32_t>(n2));
+}
+
+// ---------------- WifiGuard: WIFI_QUIET / freshness 5 ケース (計画書 §3.1) ----------------
+
+static void test_wifi_quiet_five_cases() {
+  // (1) no-publish: loop_count が常に 0 のまま (未 publish の既定値)
+  {
+    FreshnessTracker ft;
+    const bool f1 = ft.observe(true, 0);
+    const bool f2 = ft.observe(true, 0);
+    TEST_ASSERT_FALSE(f1);
+    TEST_ASSERT_FALSE(f2);
+    TEST_ASSERT_TRUE(wifiQuiet(f2, false, false));
+  }
+  // (2) stale-loop: 前進後に停滞
+  {
+    FreshnessTracker ft;
+    ft.observe(true, 10);
+    const bool f1 = ft.observe(true, 11);
+    TEST_ASSERT_TRUE(f1);
+    const bool f2 = ft.observe(true, 11);
+    TEST_ASSERT_FALSE(f2);
+    TEST_ASSERT_TRUE(wifiQuiet(f2, false, false));
+  }
+  // (3) read-fail
+  {
+    FreshnessTracker ft;
+    ft.observe(true, 5);
+    const bool f = ft.observe(false, 999);
+    TEST_ASSERT_FALSE(f);
+    TEST_ASSERT_TRUE(wifiQuiet(f, false, false));
+  }
+  // (4) fresh だが Balancing
+  {
+    FreshnessTracker ft;
+    ft.observe(true, 1);
+    const bool f = ft.observe(true, 2);
+    TEST_ASSERT_TRUE(f);
+    TEST_ASSERT_TRUE(wifiQuiet(f, /*balancing=*/true, false));
+  }
+  // (5) fresh かつ非 Balancing かつ非 arm_pending → quiet ではない
+  {
+    FreshnessTracker ft;
+    ft.observe(true, 1);
+    const bool f = ft.observe(true, 2);
+    TEST_ASSERT_TRUE(f);
+    TEST_ASSERT_FALSE(wifiQuiet(f, false, false));
+  }
+}
+
+// ---------------- WifiGuard: begin/abort 状態機械 (計画書 §3.1) ----------------
+
+static void test_wifi_guard_begin_gated_by_quiet() {
+  FakeWifiState st;
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  WifiGuard g(makeFakeOps(&st), p);
+
+  g.tick(true, 1, false, false);  // 初回観測: fresh 未確定 → quiet
+  TEST_ASSERT_EQUAL(0, st.begin_calls);
+
+  g.tick(true, 2, /*balancing=*/true, false);  // fresh だが Balancing → quiet
+  TEST_ASSERT_EQUAL(0, st.begin_calls);
+
+  g.tick(true, 3, false, false);  // fresh ∧ 非Balancing ∧ 非arm_pending → begin
+  TEST_ASSERT_EQUAL(1, st.begin_calls);
+  TEST_ASSERT_TRUE(g.connecting());
+}
+
+static void test_wifi_guard_connecting_abort_exactly_once() {
+  FakeWifiState st;
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  p.abort_confirm_ticks = 2;
+  WifiGuard g(makeFakeOps(&st), p);
+
+  g.tick(true, 1, false, false);
+  g.tick(true, 2, false, false);  // begin 発行 → connecting_
+  TEST_ASSERT_EQUAL(1, st.begin_calls);
+  TEST_ASSERT_TRUE(g.connecting());
+
+  // CONNECTING 中に Balancing へ遷移 (WIFI_QUIET) → ちょうど1回の disconnect
+  g.tick(true, 3, /*balancing=*/true, false);
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);
+  TEST_ASSERT_TRUE(g.aborting());
+
+  // 確認イベント (自発的切断 = ASSOC_LEAVE) 到着 → abort 完了
+  g.pushEvent(WifiGuard::EventKind::StaDisconnected, WifiGuard::kReasonAssocLeave);
+  g.tick(true, 4, true, false);
+  TEST_ASSERT_FALSE(g.aborting());
+  TEST_ASSERT_FALSE(g.connecting());
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);  // 追加の disconnect は発行されない
+
+  // Balancing が続く間、begin の retry は発行されない
+  g.tick(true, 5, true, false);
+  TEST_ASSERT_EQUAL(1, st.begin_calls);
+
+  // Balancing 終了・fresh 観測 → 新規 begin
+  g.tick(true, 6, false, false);
+  TEST_ASSERT_EQUAL(2, st.begin_calls);
+}
+
+static void test_wifi_guard_abort_ignores_time_without_confirm_event() {
+  // 「status が非接続でも one-shot begin が継続中」を模す: 確認イベントが来ない限り
+  // 何 tick 待っても abort は解除されない (status 変化だけでは完了扱いしない)。
+  FakeWifiState st;
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  p.abort_confirm_ticks = 1000;  // 十分長く待たせる (disconnect() 自体は成功するため retry も起きない)
+  WifiGuard g(makeFakeOps(&st), p);
+
+  g.tick(true, 1, false, false);
+  g.tick(true, 2, false, false);
+  g.tick(true, 3, true, false);  // Balancing へ → abort 開始
+  TEST_ASSERT_TRUE(g.aborting());
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);
+
+  for (uint32_t i = 0; i < 20; ++i) {
+    g.tick(true, 4 + i, true, false);
+    TEST_ASSERT_TRUE(g.aborting());
+  }
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);  // 時間経過だけでは retry も完了もしない
+
+  g.pushEvent(WifiGuard::EventKind::StaDisconnected, WifiGuard::kReasonAssocLeave);
+  g.tick(true, 100, true, false);
+  TEST_ASSERT_FALSE(g.aborting());
+}
+
+static void test_wifi_guard_abort_retry_then_radio_off_latch() {
+  FakeWifiState st;
+  st.disconnect_return = false;  // disconnect() が常に失敗を返す
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  p.abort_confirm_ticks = 2;
+  p.abort_max_retries = 2;
+  WifiGuard g(makeFakeOps(&st), p);
+
+  g.tick(true, 1, false, false);
+  g.tick(true, 2, false, false);  // begin → connecting_
+  TEST_ASSERT_TRUE(g.connecting());
+
+  g.tick(true, 3, true, false);  // Balancing へ → abort 開始 (1回目、失敗)
+  TEST_ASSERT_TRUE(g.aborting());
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);
+
+  g.tick(true, 4, true, false);  // disconnect() 失敗 → 即座にリトライ
+  TEST_ASSERT_EQUAL(2, st.disconnect_calls);
+  TEST_ASSERT_TRUE(g.aborting());
+
+  g.tick(true, 5, true, false);  // 2回目のリトライ (上限到達)
+  TEST_ASSERT_EQUAL(3, st.disconnect_calls);
+  TEST_ASSERT_TRUE(g.aborting());
+
+  g.tick(true, 6, true, false);  // リトライ上限到達 → radio off へ
+  TEST_ASSERT_FALSE(g.aborting());
+  TEST_ASSERT_TRUE(g.radioOffPending());
+  TEST_ASSERT_EQUAL(1, st.set_radio_off_calls);
+  TEST_ASSERT_FALSE(g.wifiAbortFailed());
+
+  st.radio_off_status = true;  // radio 停止の確認
+  g.tick(true, 7, true, false);
+  TEST_ASSERT_TRUE(g.wifiAbortFailed());
+  TEST_ASSERT_EQUAL_UINT32(1u, g.wifiAbortFailedTotal());
+
+  // 以降 Wi-Fi 活動は全停止 (Balancing 終了後も begin は再発行されない)
+  g.tick(true, 8, false, false);
+  TEST_ASSERT_EQUAL(1, st.begin_calls);
+}
+
+// ---------------- WifiGuard: lib_reconnect_pending ライフサイクル (計画書 §3.1) ----------------
+
+static void test_wifi_guard_lib_reconnect_idle_resolves_then_arm_no_abort() {
+  FakeWifiState st;
+  // reconnect_backoff_ticks は既定値のまま (>0) にする: 0 にすると AP 喪失の同一
+  // tick で guard 自身の begin() が即座に再発行され (§3.1 ライフサイクル条件 (d))、
+  // lib_reconnect_pending が観測できないまま同時にクリアされてしまうため。
+  WifiGuard::Params p;
+  WifiGuard g(makeFakeOps(&st), p);
+
+  g.tick(true, 1, false, false);
+  g.tick(true, 2, false, false);  // begin
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 3, false, false);
+  TEST_ASSERT_TRUE(g.connected());
+
+  // Idle 中 (非 Balancing・非 arm_pending) に AP 一時喪失 → ライブラリ one-shot 発火
+  g.pushEvent(WifiGuard::EventKind::StaDisconnected, /*reason=*/1);
+  g.tick(true, 4, false, false);
+  TEST_ASSERT_TRUE(g.libReconnectPending());
+  TEST_ASSERT_EQUAL(0, st.disconnect_calls);  // Idle 中は abort しない
+
+  // one-shot 成功 (GOT_IP) → pending クリア
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 5, false, false);
+  TEST_ASSERT_FALSE(g.libReconnectPending());
+
+  // その後 arm (Balancing) → disconnect は発行されない
+  g.tick(true, 6, /*balancing=*/true, false);
+  TEST_ASSERT_EQUAL(0, st.disconnect_calls);
+}
+
+static void test_wifi_guard_lib_reconnect_one_shot_failure_clears_pending() {
+  FakeWifiState st;
+  // 既定の reconnect_backoff_ticks (>0) を使う (理由は上のテストと同じ)。
+  WifiGuard::Params p;
+  WifiGuard g(makeFakeOps(&st), p);
+
+  g.tick(true, 1, false, false);
+  g.tick(true, 2, false, false);
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 3, false, false);
+
+  g.pushEvent(WifiGuard::EventKind::StaDisconnected, /*reason=*/1);
+  g.tick(true, 4, false, false);
+  TEST_ASSERT_TRUE(g.libReconnectPending());
+
+  // one-shot の begin() も失敗 → 再度の非自発切断 (b): in-flight 終了とみなし clear
+  g.pushEvent(WifiGuard::EventKind::StaDisconnected, /*reason=*/1);
+  g.tick(true, 5, false, false);
+  TEST_ASSERT_FALSE(g.libReconnectPending());
+  TEST_ASSERT_EQUAL(0, st.disconnect_calls);  // Idle 中なので abort は発行されない
+}
+
+static void test_wifi_guard_lib_reconnect_during_arm_pending_aborts_once() {
+  FakeWifiState st;
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  p.abort_confirm_ticks = 2;
+  WifiGuard g(makeFakeOps(&st), p);
+
+  g.tick(true, 1, false, false);
+  g.tick(true, 2, false, false);
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 3, false, false);
+  TEST_ASSERT_TRUE(g.connected());
+
+  // 直立ホールド (arm_pending) 中に AP 喪失 → ライブラリ one-shot 発火
+  g.pushEvent(WifiGuard::EventKind::StaDisconnected, /*reason=*/1);
+  g.tick(true, 4, /*balancing=*/false, /*arm_pending=*/true);
+  TEST_ASSERT_TRUE(g.aborting());
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);
+
+  g.pushEvent(WifiGuard::EventKind::StaDisconnected, WifiGuard::kReasonAssocLeave);
+  g.tick(true, 5, false, true);
+  TEST_ASSERT_FALSE(g.aborting());
+  TEST_ASSERT_FALSE(g.libReconnectPending());
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);  // ちょうど1回
+}
+
+// ---------------- WifiGuard: prewarm / udp_ready (計画書 §3.1) ----------------
+
+static void test_wifi_guard_prewarm_beginpacket_failure_blocks_write() {
+  FakeWifiState st;
+  st.begin_packet_return = 0;  // 常に失敗 (socket/malloc 失敗を模す)
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  WifiGuard g(makeFakeOps(&st), p);
+
+  g.tick(true, 1, false, false);
+  g.tick(true, 2, false, false);
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 3, false, false);
+  TEST_ASSERT_TRUE(g.connected());
+  TEST_ASSERT_TRUE(g.readyToAttempt());
+
+  const uint8_t payload[4] = {1, 2, 3, 4};
+  const WifiGuard::SendOutcome o = g.trySend(payload, sizeof(payload));
+  TEST_ASSERT_EQUAL(static_cast<int>(WifiGuard::SendOutcome::BeginPacketFailed),
+                    static_cast<int>(o));
+  TEST_ASSERT_EQUAL(0, st.write_calls);  // beginPacket 失敗後は write に進まない
+  TEST_ASSERT_EQUAL(0, st.end_packet_calls);
+  TEST_ASSERT_FALSE(g.udpReady());
+  TEST_ASSERT_EQUAL_UINT32(1u, g.prewarmFailTotal());
+}
+
+static void test_wifi_guard_prewarm_withheld_during_arm_pending() {
+  FakeWifiState st;
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  WifiGuard g(makeFakeOps(&st), p);
+
+  g.tick(true, 1, false, false);
+  g.tick(true, 2, false, false);  // begin
+
+  // arm_pending 中に GOT_IP (Connected 遷移) が来ても prewarm は保留される
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 3, false, /*arm_pending=*/true);
+  TEST_ASSERT_TRUE(g.connected());
+  TEST_ASSERT_FALSE(g.readyToAttempt());
+  TEST_ASSERT_EQUAL(0, st.begin_packet_calls);
+
+  // arm_pending 解消 → prewarm 許可
+  g.tick(true, 4, false, false);
+  TEST_ASSERT_TRUE(g.readyToAttempt());
+}
+
+static void test_wifi_guard_endpacket_failure_keeps_udp_ready_during_balancing() {
+  FakeWifiState st;
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  WifiGuard g(makeFakeOps(&st), p);
+
+  g.tick(true, 1, false, false);
+  g.tick(true, 2, false, false);
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 3, false, false);
+
+  const uint8_t payload[4] = {1, 2, 3, 4};
+  TEST_ASSERT_EQUAL(static_cast<int>(WifiGuard::SendOutcome::Sent),
+                    static_cast<int>(g.trySend(payload, sizeof(payload))));
+  TEST_ASSERT_TRUE(g.udpReady());
+
+  // Balancing 中の endPacket 失敗: udp_ready を維持したまま送信失敗として計上
+  g.tick(true, 4, /*balancing=*/true, false);
+  st.end_packet_return = 0;
+  const WifiGuard::SendOutcome o2 = g.trySend(payload, sizeof(payload));
+  TEST_ASSERT_EQUAL(static_cast<int>(WifiGuard::SendOutcome::EndPacketFailed),
+                    static_cast<int>(o2));
+  TEST_ASSERT_TRUE(g.udpReady());  // 維持される
+  TEST_ASSERT_EQUAL_UINT32(1u, g.sendFailTotal());
+}
+
+// ---------------- 統合: armPending() が Wi-Fi 接続を Balancing 前に abort する ----------------
+// (計画書 §3.1: commissioned auto-arm と BtnC 手動アームの両経路で同一機構であることの確認)
+
+static void runArmPendingAbortsInFlightConnection(SafetyFsm& fsm, float start_now) {
+  TEST_ASSERT_EQUAL(static_cast<int>(FsmState::Idle), static_cast<int>(fsm.state()));
+
+  FakeWifiState st;
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  p.abort_confirm_ticks = 2;
+  WifiGuard g(makeFakeOps(&st), p);
+
+  float now = start_now;
+  uint32_t loop_count = 0;
+  for (int i = 0; i < 3; ++i) {
+    ++loop_count;
+    g.tick(true, loop_count, false, fsm.armPending());
+  }
+  TEST_ASSERT_TRUE(g.connecting());
+  TEST_ASSERT_EQUAL(1, st.begin_calls);
+
+  bool aborted_before_balancing = false;
+  bool requested = false;
+  for (int i = 0; i < 260 && !requested; ++i) {
+    now += 0.005f;
+    ++loop_count;
+    const SafetyFsm::Result r = fsm.update(uprightInput(now));
+    if (r.action == FsmAction::EnterBalancing) requested = true;
+    g.tick(true, loop_count, fsm.state() == FsmState::Balancing, fsm.armPending());
+    if (fsm.armPending() && g.aborting()) {
+      g.pushEvent(WifiGuard::EventKind::StaDisconnected, WifiGuard::kReasonAssocLeave);
+    }
+    if (st.disconnect_calls > 0 && !g.connecting()) aborted_before_balancing = true;
+  }
+  TEST_ASSERT_TRUE(requested);
+  TEST_ASSERT_TRUE(aborted_before_balancing);
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);  // ちょうど1回の abort
+
+  fsm.notifyBalancingEntered();
+  ++loop_count;
+  g.tick(true, loop_count, true, fsm.armPending());
+  TEST_ASSERT_EQUAL(1, st.begin_calls);  // Balancing 中に begin は再発行されない
+}
+
+static void test_integration_wifi_abort_before_balancing_auto_arm() {
+  SafetyFsm fsm;
+  fsm.setParams(fsmParams(true, true));
+  fsm.notifyInitDone();
+  runArmPendingAbortsInFlightConnection(fsm, 0.0f);
+}
+
+static void test_integration_wifi_abort_before_balancing_manual_arm() {
+  SafetyFsm fsm;
+  fsm.setParams(fsmParams(false, true));  // 未コミッショニング → Disarmed 起動
+  fsm.notifyInitDone();
+  float now = 0.0f;
+  SafetyFsm::Input in = uprightInput(now += 0.005f);
+  in.stop_toggle = true;  // BtnC 手動アーム → Idle
+  fsm.update(in);
+  runArmPendingAbortsInFlightConnection(fsm, now);
+}
+
+// ---------------- SharedState: critical section 置換 (計画書 §3.1 前提修正) ----------------
+
+static void test_shared_state_concurrent_publish_read_no_torn_read() {
+  shared::SharedState state;
+  std::atomic<bool> stop{false};
+  std::atomic<bool> torn_detected{false};
+  std::atomic<uint64_t> reads{0};
+  std::atomic<uint64_t> writes{0};
+
+  std::thread writer([&]() {
+    shared::Snapshot s;
+    uint32_t i = 0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      ++i;
+      s.loop_count = i;
+      s.theta = static_cast<float>(i);
+      s.dt_hist_total[0] = i;
+      s.dt_hist_total[7] = i;
+      s.overrun_total = i;
+      s.imu_stale_total = i;
+      state.publish(s);
+      writes.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+
+  std::thread reader([&]() {
+    shared::Snapshot out;
+    while (!stop.load(std::memory_order_relaxed)) {
+      if (state.read(&out)) {
+        reads.fetch_add(1, std::memory_order_relaxed);
+        // 全フィールドが同一の loop_count 由来の値で揃っているか (torn なら不一致)
+        if (static_cast<uint32_t>(out.theta) != out.loop_count ||
+            out.dt_hist_total[0] != out.loop_count ||
+            out.dt_hist_total[7] != out.loop_count ||
+            out.overrun_total != out.loop_count ||
+            out.imu_stale_total != out.loop_count) {
+          torn_detected.store(true, std::memory_order_relaxed);
+        }
+      }
+    }
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  stop.store(true, std::memory_order_relaxed);
+  writer.join();
+  reader.join();
+
+  TEST_ASSERT_FALSE(torn_detected.load());
+  TEST_ASSERT_TRUE(reads.load() > 0);   // 両タスクが実際に進行したこと
+  TEST_ASSERT_TRUE(writes.load() > 0);
+}
+
 // ---------------- runner ----------------
 
 int main(int, char**) {
@@ -660,5 +1307,27 @@ int main(int, char**) {
   RUN_TEST(test_params_defaults_valid);
   RUN_TEST(test_commissioning_fail_closed);
   RUN_TEST(test_fsm_entry_failed);
+
+  // UDP telemetry Phase1 (計画書 §3.1)
+  RUN_TEST(test_fsm_arm_pending_auto_arm);
+  RUN_TEST(test_fsm_arm_pending_manual_arm);
+  RUN_TEST(test_dt_histogram_boundaries);
+  RUN_TEST(test_dt_monotonic_counter_survives_consecutive_reset);
+  RUN_TEST(test_telemetry_format_full_and_diag_success);
+  RUN_TEST(test_telemetry_format_truncation_forced);
+  RUN_TEST(test_wifi_quiet_five_cases);
+  RUN_TEST(test_wifi_guard_begin_gated_by_quiet);
+  RUN_TEST(test_wifi_guard_connecting_abort_exactly_once);
+  RUN_TEST(test_wifi_guard_abort_ignores_time_without_confirm_event);
+  RUN_TEST(test_wifi_guard_abort_retry_then_radio_off_latch);
+  RUN_TEST(test_wifi_guard_lib_reconnect_idle_resolves_then_arm_no_abort);
+  RUN_TEST(test_wifi_guard_lib_reconnect_one_shot_failure_clears_pending);
+  RUN_TEST(test_wifi_guard_lib_reconnect_during_arm_pending_aborts_once);
+  RUN_TEST(test_wifi_guard_prewarm_beginpacket_failure_blocks_write);
+  RUN_TEST(test_wifi_guard_prewarm_withheld_during_arm_pending);
+  RUN_TEST(test_wifi_guard_endpacket_failure_keeps_udp_ready_during_balancing);
+  RUN_TEST(test_integration_wifi_abort_before_balancing_auto_arm);
+  RUN_TEST(test_integration_wifi_abort_before_balancing_manual_arm);
+  RUN_TEST(test_shared_state_concurrent_publish_read_no_torn_read);
   return UNITY_END();
 }
