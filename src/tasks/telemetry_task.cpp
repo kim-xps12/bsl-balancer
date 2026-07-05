@@ -107,11 +107,18 @@ void telemetryTaskEntry(void*) {
 
     if (!g_guard->readyToAttempt()) continue;
 
-    ++seq;  // seq = 送信 datagram の通し番号 (計画書 §3.1)
+    // seq は「送信 datagram の通し番号」(計画書 §3.1) であり、trySend が実際に
+    // datagram を送出できた場合のみ消費されなければならない。ここではまだ
+    // "候補" (seq_candidate = seq + 1) として packet を整形するだけに留め、
+    // 確定 (seq への反映) は下記 trySend の戻り値が Sent の場合のみ行う
+    // (ゲート2レビュー(5回目)指摘1対応)。trySend が失敗 (beginPacket/write/
+    // endPacket のいずれかが失敗) した場合は datagram が出ていないため、次回
+    // tick で同じ候補値が再利用されても重複にはならない。
+    const uint32_t seq_candidate = seq + 1;
     size_t len = 0;
     if (!read_ok) {
       core::TelemetryDiagFields df;
-      df.seq = seq;
+      df.seq = seq_candidate;
       df.tick = tick;
       df.t_us = esp_timer_get_time();
       df.dev = g_dev_id;
@@ -122,7 +129,7 @@ void telemetryTaskEntry(void*) {
       len = core::formatDiagPacket(buf, sizeof(buf), df);
     } else {
       core::TelemetryFullFields ff;
-      ff.seq = seq;
+      ff.seq = seq_candidate;
       ff.tick = tick;
       ff.t_us = esp_timer_get_time();
       ff.dev = g_dev_id;
@@ -161,7 +168,7 @@ void telemetryTaskEntry(void*) {
         // truncation: 送信せず診断 datagram で報告する (計画書 §3.1。不正 JSON を送らない)
         ++trunc_total;
         core::TelemetryDiagFields df;
-        df.seq = seq;
+        df.seq = seq_candidate;
         df.tick = tick;
         df.t_us = esp_timer_get_time();
         df.dev = g_dev_id;
@@ -174,7 +181,14 @@ void telemetryTaskEntry(void*) {
     }
 
     if (len > 0) {
-      g_guard->trySend(reinterpret_cast<const uint8_t*>(buf), len);
+      const core::WifiGuard::SendOutcome outcome =
+          g_guard->trySend(reinterpret_cast<const uint8_t*>(buf), len);
+      // seq の確定は datagram が実際に送出できた場合のみ (計画書 §3.1)。
+      // 失敗時は seq を据え置き、次 tick で同じ candidate 値を再試行する
+      // (datagram が出ていないため重複にはならない)。
+      if (outcome == core::WifiGuard::SendOutcome::Sent) {
+        seq = seq_candidate;
+      }
     }
   }
 }

@@ -56,6 +56,77 @@ def _uint32_forward_delta(prev: int, curr: int) -> Optional[int]:
     return delta
 
 
+def _is_exact_duplicate(prev_packet: Optional[Dict[str, Any]], curr_packet: Dict[str, Any]) -> bool:
+    """True if `curr_packet` is a byte-for-byte retransmission of `prev_packet`.
+
+    UDP can deliver a duplicate datagram (e.g. a retry racing the original
+    arriving late); that is a harmless network-layer artifact, not a device
+    reboot, and must not be double-counted into variant/loss/dt stats either
+    (2026-07-05 review 指摘2a).
+    """
+    return prev_packet is not None and prev_packet == curr_packet
+
+
+def _detect_reboot(prev_packet: Optional[Dict[str, Any]], curr_packet: Dict[str, Any]) -> bool:
+    """Shared reboot predicate for analyze_records() and assign_reboot_epochs().
+
+    Both callers must agree on exactly where a reboot boundary falls
+    (analyze_records uses it to decide when to re-anchor its interval/delta
+    baselines; assign_reboot_epochs uses it to key events/raw excerpts by
+    epoch), otherwise event ordering (指摘2) and raw-excerpt keying (指摘3)
+    can silently disagree with the interval re-anchoring. Exposed as a
+    standalone function (rather than duplicated inline in both places) for
+    exactly that reason.
+
+    A firmware boot session is expected to make forward progress in `seq`,
+    `tick` and `t_us` from one packet to the next; a reboot resets all three
+    counters near zero. This predicate treats the current packet as unable
+    to represent forward progress from `prev_packet` (i.e. a reboot) unless
+    it is a harmless exact retransmission:
+
+      - `prev_packet` is None (first record ever seen): never a reboot.
+      - `curr_packet` is byte-identical to `prev_packet`: an exact UDP-level
+        duplicate datagram, NOT a reboot (2026-07-05 review 指摘2a). This
+        must be checked before the seq/tick/t_us rules below, since an
+        exact duplicate has "seq unchanged", which would otherwise match
+        the same-seq-differing-content rule.
+      - `seq` or `tick` regresses (uint32-wrap-aware, see
+        _uint32_forward_delta) relative to `prev_packet` -> reboot
+        (2026-07-05 review 指摘2b).
+      - `t_us` regresses -> reboot (指摘2b). Not uint32-wrap-checked: `t_us`
+        is `esp_timer_get_time()` microseconds since boot (int64), which
+        does not wrap over any realistic session length.
+      - `seq` is unchanged (forward delta 0) but the packet is not an exact
+        duplicate (i.e. some other field differs) -> reboot (2026-07-05
+        review 指摘2c). This covers a very-short-lived boot that crashes
+        again before its counters have advanced past the previous boot's
+        last successfully emitted `seq` value: reconnect-time jitter right
+        after startup can make the second boot's first successful send land
+        on the very same `seq` as the first boot's, without `t_us` or
+        `tick` necessarily having regressed on their own (e.g. the second
+        boot takes longer to reconnect, so its later-in-time `t_us` can
+        exceed the first boot's very early `t_us`) -- the old predicate
+        (seq-forward-delta-is-None OR t_us decreased) missed exactly this
+        case and silently analyzed the reset post-reboot counters against
+        the stale pre-reboot baseline.
+    """
+    if prev_packet is None:
+        return False
+    if _is_exact_duplicate(prev_packet, curr_packet):
+        return False
+
+    seq_delta = _uint32_forward_delta(prev_packet["seq"], curr_packet["seq"])
+    if seq_delta is None:
+        return True
+    if _uint32_forward_delta(prev_packet["tick"], curr_packet["tick"]) is None:
+        return True
+    if curr_packet["t_us"] < prev_packet["t_us"]:
+        return True
+    if seq_delta == 0:
+        return True  # same seq, content differs (duplicate already ruled out above)
+    return False
+
+
 def _percentile(sorted_values: Sequence[float], pct: float) -> Optional[float]:
     """Nearest-rank percentile. Returns None for an empty sequence."""
     if not sorted_values:
@@ -172,34 +243,31 @@ def assign_reboot_epochs(records: Sequence[Dict[str, Any]]) -> List[int]:
     reboot) for each record in `records`, aligned by position.
 
     A "reboot" here is exactly the condition analyze_records() uses to
-    re-anchor its baselines: a uint32-wrap-aware backward jump in `seq`, or
-    a backward jump in `t_us`. Firmware `seq` restarts at 1 after a reboot
-    while the receiver keeps appending to the same session, so `seq` alone
-    is not a safe ordering/keying key once a reboot has occurred (指摘2:
+    re-anchor its baselines -- see _detect_reboot() for the full predicate
+    (uint32-wrap-aware backward jump in `seq`/`tick`, a backward jump in
+    `t_us`, or an unchanged `seq` whose content differs from a harmless
+    exact duplicate). Firmware `seq` restarts at 1 after a reboot while the
+    receiver keeps appending to the same session, so `seq` alone is not a
+    safe ordering/keying key once a reboot has occurred (指摘2:
     events.jsonl/report ordering, 指摘3: report.py raw excerpt keying).
     Exposed as a standalone helper (rather than inlined only in
     analyze_records) so report.py can independently derive the same epoch
     for raw.jsonl records without analyzer.py and report.py ever
-    disagreeing on where a reboot boundary falls.
+    disagreeing on where a reboot boundary falls; sharing _detect_reboot()
+    with analyze_records() is what keeps the two in agreement (指摘2 review:
+    a second, subtly different reboot predicate copy-pasted here previously
+    missed the same-seq-differing-content case that analyze_records()'s
+    inline predicate also missed).
     """
     epochs: List[int] = []
     epoch = 0
-    prev_seq: Optional[int] = None
-    prev_t_us: Optional[int] = None
+    prev_packet: Optional[Dict[str, Any]] = None
     for record in records:
         packet = record["packet"]
-        seq = packet["seq"]
-        t_us = packet["t_us"]
-        is_reboot = False
-        if prev_seq is not None and _uint32_forward_delta(prev_seq, seq) is None:
-            is_reboot = True
-        if prev_t_us is not None and t_us < prev_t_us:
-            is_reboot = True
-        if is_reboot:
+        if _detect_reboot(prev_packet, packet):
             epoch += 1
         epochs.append(epoch)
-        prev_seq = seq
-        prev_t_us = t_us
+        prev_packet = packet
     return epochs
 
 
@@ -225,6 +293,7 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
     prev_seq: Optional[int] = None
     prev_t_us: Optional[int] = None
+    prev_packet: Optional[Dict[str, Any]] = None
     lost_estimate = 0
     reboot_count = 0
 
@@ -258,6 +327,17 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
     for record_idx, record in enumerate(records):
         packet = record["packet"]
+        epoch = epochs[record_idx]
+
+        if _is_exact_duplicate(prev_packet, packet):
+            # Harmless UDP-level duplicate datagram (same seq, same
+            # everything): must not be double-counted into variant/loss/dt
+            # stats, and must not look like a stalled control loop (a
+            # loop/dt_h delta of exactly zero) or a reboot (指摘2a). Leave
+            # every baseline untouched (there is nothing new to anchor on)
+            # and move on to the next record.
+            continue
+
         seq = packet["seq"]
         tick = packet["tick"]
         t_us = packet["t_us"]
@@ -266,14 +346,12 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         variant = "full" if packet.get("snap_valid") else "diagnostic"
         variant_counts[variant] += 1
         tick_seq_gaps.append(tick - seq)
-        epoch = epochs[record_idx]
 
-        is_reboot = False
-        if prev_seq is not None:
+        is_reboot = _detect_reboot(prev_packet, packet)
+
+        if not is_reboot and prev_seq is not None:
             delta = _uint32_forward_delta(prev_seq, seq)
-            if delta is None:
-                is_reboot = True
-            elif delta > 1:
+            if delta is not None and delta > 1:
                 lost = delta - 1
                 lost_estimate += lost
                 loss_events.append(
@@ -286,8 +364,6 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                         "lost_packets": lost,
                     }
                 )
-        if prev_t_us is not None and t_us < prev_t_us:
-            is_reboot = True
 
         if is_reboot:
             reboot_count += 1
@@ -321,6 +397,7 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
         prev_seq = seq
         prev_t_us = t_us
+        prev_packet = packet
 
         # dev/fw change detection happens after the reboot handling above so
         # a change observed on the very first post-reboot packet is tagged

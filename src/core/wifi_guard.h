@@ -122,7 +122,17 @@ class WifiGuard {
   void pushEvent(EventKind kind, uint8_t reason = 0) {
     const uint32_t h = ev_head_.load(std::memory_order_relaxed);
     const uint32_t t = ev_tail_.load(std::memory_order_acquire);
-    if (h - t >= kEventQueueLen) return;  // 満杯 → 破棄 (fail-closed 側の判定が遅れるだけ)
+    if (h - t >= kEventQueueLen) {
+      // 満杯 → 破棄。GOT_IP/STA_DISCONNECTED は lib_reconnect_pending_ 設定・
+      // stale connected_ クリア・abort 完了確認の唯一の入力源であるため、
+      // 破棄は「判定が遅れるだけ」ではなく安全イベントの喪失そのものである
+      // (2026-07-05 ゲート2レビュー(5回目)指摘3)。fail-closed 化のため atomic
+      // な overflow フラグを latch する。tick() 側が drainEvents() 直後に
+      // これを検出し、状態不明として保守的にリセット + 有界キャンセルへ
+      // 遷移する (詳細は tick() 側のコメント)。
+      event_overflow_.store(true, std::memory_order_release);
+      return;
+    }
     event_q_[h % kEventQueueLen] = QueuedEvent{kind, reason};
     ev_head_.store(h + 1, std::memory_order_release);
   }
@@ -141,6 +151,29 @@ class WifiGuard {
     connection_established_in_drain_ = false;
 
     if (abort_failed_latched_) return;  // 全停止ラッチ後は Wi-Fi 活動を再開しない
+
+    // イベントキュー満杯による破棄の検出 (指摘3): 破棄された GOT_IP/
+    // STA_DISCONNECTED は connected_/connecting_/lib_reconnect_pending_/
+    // udp_ready_ 等の唯一の入力源であり、破棄が起きた時点でこれらの派生状態は
+    // もはや正しさを保証できない (「状態不明」)。fail-closed に倒し、
+    // 接続系の派生状態を disconnected 基線へリセットした上で、in-flight な
+    // 接続活動があり得る前提で startAbort() を 1 回発行し、既存の有界
+    // キャンセル経路 (確認 → リトライ → WIFI_OFF 終端) に乗せる
+    // (aborting_/radio_off_pending_ も一旦リセットしてから再発行することで、
+    // 破棄によって完了確認イベントを取りこぼした可能性のある進行中の
+    // abort/radio-off も仕切り直す)。overflow フラグは exchange で
+    // 消費・リセットする (2026-07-05 ゲート2レビュー(5回目)指摘3)。
+    if (event_overflow_.exchange(false, std::memory_order_acq_rel)) {
+      ++event_overflow_total_;
+      connected_ = false;
+      connecting_ = false;
+      lib_reconnect_pending_ = false;
+      udp_ready_ = false;
+      aborting_ = false;
+      radio_off_pending_ = false;
+      startAbort();
+      return;
+    }
 
     const bool fresh = freshness_.observe(read_ok, loop_count);
     const bool quiet = wifiQuiet(fresh, balancing, arm_pending);
@@ -236,13 +269,19 @@ class WifiGuard {
   uint32_t prewarmFailTotal() const { return prewarm_fail_total_; }
   uint32_t sendFailTotal() const { return send_fail_total_; }
   uint32_t wifiAbortFailedTotal() const { return wifi_abort_failed_total_; }
+  uint32_t eventOverflowTotal() const { return event_overflow_total_; }
 
  private:
   struct QueuedEvent {
     EventKind kind;
     uint8_t reason;
   };
-  static constexpr uint32_t kEventQueueLen = 8;
+  // 8 → 16 (指摘3): 満杯時の破棄は安全イベント (GOT_IP/STA_DISCONNECTED) の
+  // 喪失に直結するため余裕を持たせて頻度を下げる。破棄自体は overflow フラグに
+  // よる fail-closed 処理で常に安全に処理されるが、キュー長拡大は
+  // tick() 20Hz と 1 tick あたり数イベント程度のバースト (STA_DISCONNECTED→
+  // GOT_IP 等) を想定した実用的な余裕。
+  static constexpr uint32_t kEventQueueLen = 16;
 
   bool popEvent(QueuedEvent* out) {
     const uint32_t t = ev_tail_.load(std::memory_order_relaxed);
@@ -404,6 +443,10 @@ class WifiGuard {
   std::atomic<uint32_t> ev_head_{0};
   std::atomic<uint32_t> ev_tail_{0};
   uint32_t epoch_ = 0;
+  // 満杯による破棄の latch (指摘3)。producer (pushEvent, イベントコールバック
+  // 文脈) が store、consumer (tick()) が exchange で読み出し+リセットする。
+  std::atomic<bool> event_overflow_{false};
+  uint32_t event_overflow_total_ = 0;
 
   // 接続状態
   bool connecting_ = false;

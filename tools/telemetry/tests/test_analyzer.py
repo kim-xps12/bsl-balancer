@@ -79,6 +79,65 @@ class RebootReanchorTests(unittest.TestCase):
         self.assertEqual(result["loss"]["gap_count"], 0)
         self.assertEqual(result["loss"]["lost_estimate"], 0)
 
+    def test_same_seq_differing_content_after_early_reboot_is_reboot(self):
+        """2026-07-05 review 指摘2: two back-to-back very-short-lived boots
+        can land their first/only successfully-sent datagrams on the exact
+        same seq value (e.g. seq=1 both times) without `t_us` ever going
+        backward -- the second boot can take longer to reconnect, so its
+        later-in-time `t_us` legitimately exceeds the first boot's very
+        early `t_us` -- while `tick` (which also restarts at boot) is lower
+        than the first boot's. The old predicate (seq-forward-delta-is-None
+        OR t_us decreased) missed this and would have silently analyzed the
+        reset post-reboot counters (loop, dt_h, ovr, stale) against the
+        stale pre-reboot baseline.
+        """
+        builder = simulator.PacketSequenceBuilder()
+        pre_reboot = builder.full_packet()  # seq=1, tick=1, t_us=50000, loop=10
+        post_reboot = dict(pre_reboot)
+        post_reboot["t_us"] = pre_reboot["t_us"] + 1  # higher: NOT a t_us regression
+        post_reboot["tick"] = 0  # lower: tick counter restarted at boot
+        post_reboot["loop"] = 0  # loop counter also restarted at boot
+        self.assertEqual(post_reboot["seq"], pre_reboot["seq"])  # same seq, by construction
+        self.assertNotEqual(post_reboot, pre_reboot)  # but NOT an exact duplicate
+
+        records = wrap_records([pre_reboot, post_reboot])
+        result = analyzer.analyze_records(records)
+        self.assertEqual(result["reboot_count"], 1)
+        reboot_events = [e for e in result["events"] if e["type"] == "reboot"]
+        self.assertEqual(len(reboot_events), 1)
+        self.assertEqual(reboot_events[0]["seq"], post_reboot["seq"])
+        self.assertEqual(reboot_events[0]["epoch"], 1)
+
+        # Must not be miscounted as ordinary seq loss (seq delta is 0).
+        self.assertEqual(result["loss"]["gap_count"], 0)
+        self.assertEqual(result["loss"]["lost_estimate"], 0)
+
+        epochs = analyzer.assign_reboot_epochs(records)
+        self.assertEqual(epochs, [0, 1])
+
+    def test_exact_duplicate_packet_is_not_reboot(self):
+        """2026-07-05 review 指摘2: a byte-for-byte UDP-level retransmission
+        (same seq, same everything) must not be misclassified as a reboot
+        just because its seq-forward-delta is 0, and must not be
+        double-counted into variant/loss stats either."""
+        builder = simulator.PacketSequenceBuilder()
+        packets = [builder.full_packet() for _ in range(3)]
+        duplicate = dict(packets[-1])  # exact retransmission of the last packet
+        packets_with_dup = packets + [duplicate, builder.full_packet()]
+
+        records = wrap_records(packets_with_dup)
+        result = analyzer.analyze_records(records)
+        self.assertEqual(result["reboot_count"], 0)
+        self.assertEqual([e for e in result["events"] if e["type"] == "reboot"], [])
+        self.assertEqual(result["loss"]["gap_count"], 0)
+        self.assertEqual(result["loss"]["lost_estimate"], 0)
+        # 5 raw records, but the duplicate must not be double-counted.
+        self.assertEqual(result["packet_count"], 5)
+        self.assertEqual(result["variant_counts"]["full"], 4)
+
+        epochs = analyzer.assign_reboot_epochs(records)
+        self.assertEqual(epochs, [0, 0, 0, 0, 0])
+
 
 class RebootOpenRegionTests(unittest.TestCase):
     """指摘1: a saturation/i2t/control_task_stall region still open at the

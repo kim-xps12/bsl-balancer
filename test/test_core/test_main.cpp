@@ -1393,6 +1393,56 @@ static void test_wifi_guard_own_begin_completes_during_quiet_aborts_once() {
   TEST_ASSERT_EQUAL(1, st.disconnect_calls);
 }
 
+// ---------------- WifiGuard: イベントキュー満杯 (2026-07-05 ゲート2レビュー
+// (5回目)指摘3, fail-closed) ----------------
+// GOT_IP/STA_DISCONNECTED はキュー満杯で破棄されると connected_/connecting_/
+// lib_reconnect_pending_/udp_ready_ の唯一の入力源を失うため、破棄が起きた
+// tick は「状態不明」として保守的に扱わなければならない: 接続系の派生状態を
+// disconnected 基線にリセットし、in-flight 活動があり得る前提で startAbort()
+// を1回発行して既存の有界キャンセル経路 (確認→リトライ→WIFI_OFF終端) に乗せる。
+
+static void test_wifi_guard_event_queue_overflow_triggers_abort_and_reset() {
+  FakeWifiState st;
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  p.abort_confirm_ticks = 2;
+  WifiGuard g(makeFakeOps(&st), p);
+
+  // 通常の接続 + prewarm 完了状態を作る。
+  g.tick(true, 1, false, false);
+  g.tick(true, 2, false, false);  // begin -> connecting_
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 3, false, false);
+  TEST_ASSERT_TRUE(g.connected());
+  const uint8_t payload[4] = {1, 2, 3, 4};
+  TEST_ASSERT_EQUAL(static_cast<int>(WifiGuard::SendOutcome::Sent),
+                    static_cast<int>(g.trySend(payload, sizeof(payload))));
+  TEST_ASSERT_TRUE(g.udpReady());
+  TEST_ASSERT_EQUAL_UINT32(0u, g.eventOverflowTotal());
+
+  // キューを溢れさせる (容量16に対し20回 push -> 末尾4回は破棄されオーバーフロー
+  // フラグが立つ)。
+  for (int i = 0; i < 20; ++i) {
+    g.pushEvent(WifiGuard::EventKind::GotIp);
+  }
+
+  // 次 tick: drainEvents() 後にオーバーフローを検出し、fail-closed 処理が走る。
+  g.tick(true, 4, false, false);
+  TEST_ASSERT_EQUAL_UINT32(1u, g.eventOverflowTotal());
+  TEST_ASSERT_FALSE(g.connected());
+  TEST_ASSERT_FALSE(g.udpReady());
+  TEST_ASSERT_TRUE(g.aborting());
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);  // startAbort() がちょうど1回発行される
+
+  // abort 完了確認 → 完了。オーバーフローラッチは exchange 済みなので、
+  // 新規イベントなしの以降の tick で再発行されない。
+  g.pushEvent(WifiGuard::EventKind::StaDisconnected, WifiGuard::kReasonAssocLeave);
+  g.tick(true, 5, false, false);
+  TEST_ASSERT_FALSE(g.aborting());
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);
+  TEST_ASSERT_EQUAL_UINT32(1u, g.eventOverflowTotal());  // 累積カウンタは保持される
+}
+
 // ---------------- 統合: armPending() が Wi-Fi 接続を Balancing 前に abort する ----------------
 // (計画書 §3.1: commissioned auto-arm と BtnC 手動アームの両経路で同一機構であることの確認)
 
@@ -1568,6 +1618,7 @@ int main(int, char**) {
   RUN_TEST(test_wifi_guard_endpacket_failure_keeps_udp_ready_during_balancing);
   RUN_TEST(test_wifi_guard_disconnect_clears_udp_ready_blocks_quiet_send_after_reconnect);
   RUN_TEST(test_wifi_guard_own_begin_completes_during_quiet_aborts_once);
+  RUN_TEST(test_wifi_guard_event_queue_overflow_triggers_abort_and_reset);
   RUN_TEST(test_integration_wifi_abort_before_balancing_auto_arm);
   RUN_TEST(test_integration_wifi_abort_before_balancing_manual_arm);
   RUN_TEST(test_shared_state_concurrent_publish_read_no_torn_read);
