@@ -324,6 +324,58 @@ class RecommendedWindowsTests(unittest.TestCase):
         self.assertEqual(windows[0]["start_seq"], 15)
 
 
+class RebootLeadInWindowTests(unittest.TestCase):
+    """ゲート2レビュー(2回目)指摘3: a reboot event's own seq/epoch describe
+    only the *post*-reboot side. Without a companion window anchored on
+    prev_seq in the pre-reboot epoch, the (epoch, seq)-keyed raw excerpt
+    (report.py, 指摘3 original) never shows the lead-in context right before
+    the reboot."""
+
+    def test_reboot_event_yields_pre_reboot_lead_in_window(self):
+        events = [
+            {
+                "type": "reboot",
+                "severity": "error",
+                "epoch": 1,
+                "seq": 1,
+                "prev_seq": 120,
+                "t_us": 500,
+                "prev_t_us": 999,
+            }
+        ]
+        windows = analyzer.build_recommended_windows(events, margin=5, limit=8)
+        self.assertEqual(len(windows), 2)
+
+        post = next(w for w in windows if w["label"] == "reboot")
+        lead_in = next(w for w in windows if w["label"] == "reboot_lead_in")
+
+        # Post-reboot window: anchored on the new epoch's seq (1).
+        self.assertEqual(post["epoch"], 1)
+        self.assertEqual(post["start_seq"], 0)  # max(0, 1-5), clamped
+        self.assertEqual(post["end_seq"], 6)
+
+        # Lead-in window: anchored on prev_seq (120) in the PREVIOUS epoch.
+        self.assertEqual(lead_in["epoch"], 0)
+        self.assertEqual(lead_in["start_seq"], 115)
+        self.assertEqual(lead_in["end_seq"], 125)
+
+        # Both halves of a reboot should be looked at first (equal priority
+        # to the plain "reboot" label), ahead of lower-priority event types.
+        self.assertLess(windows.index(post), 2)
+        self.assertLess(windows.index(lead_in), 2)
+
+    def test_synthetic_reboot_without_epoch_field_yields_single_window(self):
+        # Regression guard: a hand-crafted reboot event lacking an "epoch"
+        # key (as used elsewhere in this module, e.g.
+        # test_reboot_and_stall_outrank_loss_and_saturation) has no reliable
+        # pre-reboot epoch to anchor a lead-in window on, so it must keep
+        # yielding exactly the one (post-reboot-shaped) window as before.
+        events = [{"type": "reboot", "severity": "error", "seq": 50, "prev_seq": 49, "t_us": 0, "prev_t_us": 100}]
+        windows = analyzer.build_recommended_windows(events, margin=2, limit=8)
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0]["label"], "reboot")
+
+
 class AnalyzeSessionTests(unittest.TestCase):
     def test_analyze_session_writes_events_and_summary_using_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:

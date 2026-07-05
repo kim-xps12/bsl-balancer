@@ -120,8 +120,12 @@ class _Session:
         self.last_activity_monotonic = time.monotonic()
 
     def record_rejected(self, source_ip: str, reason: str) -> None:
+        # Only accepted packets anchor the idle clock (gate2 review round2
+        # finding #2): if a rejected datagram (e.g. an IP-pinning mismatch)
+        # refreshed last_activity_monotonic, a noisy rejected source could
+        # keep the session open indefinitely even after the real device has
+        # gone silent, delaying summary.json indefinitely.
         _tally_rejected(self.rejected, source_ip, reason)
-        self.last_activity_monotonic = time.monotonic()
 
     def close(self) -> Dict[str, Any]:
         ended_at = datetime.now().astimezone().isoformat(timespec="seconds")

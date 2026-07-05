@@ -1084,6 +1084,76 @@ static void test_wifi_guard_lib_reconnect_during_arm_pending_aborts_once() {
   TEST_ASSERT_EQUAL(1, st.disconnect_calls);  // ちょうど1回
 }
 
+// ---------------- WifiGuard: 同一 tick 内で pending→GotIp が完結するケース
+// (ゲート2レビュー(2回目)指摘1) ----------------
+// arm_pending/Balancing 中の AP 喪失で、次の tick までの間に
+// STA_DISCONNECTED(非自発的) と後続の GOT_IP の両方がキューされると、両方が
+// 同一 tick の drainEvents() 内で drain される。GotIp ハンドラが
+// lib_reconnect_pending_ をクリアしてしまうため、ラッチがなければ直後の
+// quiet 判定は connecting_/lib_reconnect_pending_ のいずれも false と観測し
+// startAbort() がスキップされてしまう (udp_ready_ 済みなら quiet 窓中に
+// 成立した接続経由で送信が再開されるバグ)。per-tick ラッチにより、この
+// ケースでも quiet であれば有界キャンセルの意味論どおり ちょうど1回
+// disconnect() が発行されることを検証する。
+
+static void test_wifi_guard_lib_reconnect_completes_same_tick_during_arm_pending_aborts_once() {
+  FakeWifiState st;
+  WifiGuard::Params p;
+  p.abort_confirm_ticks = 2;
+  WifiGuard g(makeFakeOps(&st), p);
+
+  g.tick(true, 1, false, false);
+  g.tick(true, 2, false, false);  // begin -> connecting_
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 3, false, false);
+  TEST_ASSERT_TRUE(g.connected());
+
+  // 直立ホールド (arm_pending) 中に AP 喪失 → ライブラリ one-shot 発火 →
+  // 同一 tick 内で one-shot 再接続の成功 (GOT_IP) までキューされる (次の 50ms
+  // tick までの間に両方のイベントが立て続けに発生したケースを模擬)。
+  g.pushEvent(WifiGuard::EventKind::StaDisconnected, /*reason=*/1);
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 4, /*balancing=*/false, /*arm_pending=*/true);
+
+  // drain 直後は lib_reconnect_pending_/connecting_ ともに false に見えるが、
+  // ラッチにより quiet 窓中に成立したこの接続は有界キャンセルされなければ
+  // ならない。
+  TEST_ASSERT_TRUE(g.aborting());
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);  // ちょうど1回
+  TEST_ASSERT_FALSE(g.libReconnectPending());
+}
+
+static void test_wifi_guard_lib_reconnect_completes_same_tick_not_quiet_keeps_connection() {
+  FakeWifiState st;
+  WifiGuard::Params p;
+  WifiGuard g(makeFakeOps(&st), p);
+
+  g.tick(true, 1, false, false);
+  g.tick(true, 2, false, false);
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 3, false, false);
+  TEST_ASSERT_TRUE(g.connected());
+
+  // 同じ「pending→GotIp が同一 tick で完結する」シーケンスでも、その tick が
+  // !WIFI_QUIET (非 Balancing・非 arm_pending・fresh) なら abort してはならず、
+  // ライブラリが自律的に再確立した接続をそのまま容認する。
+  g.pushEvent(WifiGuard::EventKind::StaDisconnected, /*reason=*/1);
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 4, /*balancing=*/false, /*arm_pending=*/false);
+
+  TEST_ASSERT_FALSE(g.aborting());
+  TEST_ASSERT_TRUE(g.connected());
+  TEST_ASSERT_EQUAL(0, st.disconnect_calls);
+  TEST_ASSERT_FALSE(g.libReconnectPending());
+
+  // ラッチは !quiet の tick で消費済み (リセット済み) であり、後続で
+  // arm_pending に入っても、この時点で新たな pending/イベントがない限り
+  // 誤って持ち越されて abort を起こしてはならない。
+  g.tick(true, 5, /*balancing=*/false, /*arm_pending=*/true);
+  TEST_ASSERT_FALSE(g.aborting());
+  TEST_ASSERT_EQUAL(0, st.disconnect_calls);
+}
+
 // ---------------- WifiGuard: abort/radio-off 中の遅延 GOT_IP (ゲート2レビュー指摘4) ----------------
 // abort/radio-off 進行中にライブラリの遅延 GOT_IP イベントが drain されると
 // connected_ が true に戻り得るが、この窓では abort-class 操作のみ許可されるため
@@ -1406,6 +1476,8 @@ int main(int, char**) {
   RUN_TEST(test_wifi_guard_lib_reconnect_idle_resolves_then_arm_no_abort);
   RUN_TEST(test_wifi_guard_lib_reconnect_one_shot_failure_clears_pending);
   RUN_TEST(test_wifi_guard_lib_reconnect_during_arm_pending_aborts_once);
+  RUN_TEST(test_wifi_guard_lib_reconnect_completes_same_tick_during_arm_pending_aborts_once);
+  RUN_TEST(test_wifi_guard_lib_reconnect_completes_same_tick_not_quiet_keeps_connection);
   RUN_TEST(test_wifi_guard_delayed_got_ip_during_abort_blocks_send);
   RUN_TEST(test_wifi_guard_delayed_got_ip_during_radio_off_pending_blocks_send);
   RUN_TEST(test_wifi_guard_prewarm_beginpacket_failure_blocks_write);

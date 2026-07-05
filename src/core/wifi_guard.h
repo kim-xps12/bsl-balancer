@@ -131,6 +131,15 @@ class WifiGuard {
   // WIFI_QUIET に基づいて begin/abort/radio-off を単一スレッドで進める。
   void tick(bool read_ok, uint32_t loop_count, bool balancing, bool arm_pending) {
     drainEvents();
+    // per-tick ラッチの消費: この tick の drainEvents() 内で「ライブラリ
+    // one-shot 再接続が完了した (pending→GotIp が同一 drain 内で完結した)」
+    // ことを検知していれば読み出し、直後に必ずリセットする (次 tick へ
+    // 持ち越さない。ゲート2レビュー(2回目)指摘1対応)。read_ok/quiet の
+    // 判定より前に消費してしまわないよう、値はローカルへ退避してから
+    // quiet 判定の分岐でのみ使う。
+    const bool lib_reconnect_completed_in_drain = lib_reconnect_completed_in_drain_;
+    lib_reconnect_completed_in_drain_ = false;
+
     if (abort_failed_latched_) return;  // 全停止ラッチ後は Wi-Fi 活動を再開しない
 
     const bool fresh = freshness_.observe(read_ok, loop_count);
@@ -154,7 +163,16 @@ class WifiGuard {
 
     // CONNECTING 中の fail-closed は abort 方向、かつ lib_reconnect_pending
     // (ライブラリ one-shot 再接続 in-flight) も同一機構で中断する (計画書 §3.1)。
-    if (quiet && (connecting_ || lib_reconnect_pending_)) {
+    // ラッチ (lib_reconnect_completed_in_drain) も同じ OR 条件に含める:
+    // arm_pending/Balancing 中の AP 喪失で STA_DISCONNECTED(非自発的) と
+    // 後続の GOT_IP が同一 tick の drainEvents() 内で両方消化されると、
+    // ここに来た時点では lib_reconnect_pending_ は既に GotIp ハンドラで
+    // クリアされ connecting_ も false なので、ラッチなしでは有界キャンセル
+    // が丸ごとスキップされてしまう (ゲート2レビュー(2回目)指摘1)。quiet 窓中
+    // に成立した接続は有界キャンセルの意味論どおり切断する。!quiet の場合は
+    // ラッチを消費しても abort しない (上で既にリセット済みなので次 tick へ
+    // 誤って持ち越されることもない)。
+    if (quiet && (connecting_ || lib_reconnect_pending_ || lib_reconnect_completed_in_drain)) {
       startAbort();
       return;
     }
@@ -256,6 +274,17 @@ class WifiGuard {
         case EventKind::GotIp:
           connected_ = true;
           connecting_ = false;
+          if (lib_reconnect_pending_) {
+            // このイベントは telemetry FSM 自身が発行した begin() ではなく、
+            // ライブラリ側 first_connect one-shot が (STA_DISCONNECTED で
+            // pending 化された後) 自律的に完了させた再接続である。同一 tick
+            // の drain 内で pending→GotIp が完結すると、drain 直後の quiet
+            // 判定では pending/connecting のいずれも既に false に見えて
+            // しまうため、per-tick ラッチに「この drain 内で完了した」ことを
+            // 記録しておく (tick() 側で quiet && ラッチ を abort 条件に含める。
+            // ゲート2レビュー(2回目)指摘1対応)。
+            lib_reconnect_completed_in_drain_ = true;
+          }
           lib_reconnect_pending_ = false;  // (a) one-shot 再接続の成功
           break;
         case EventKind::StaDisconnected: {
@@ -380,6 +409,10 @@ class WifiGuard {
   bool lib_first_connect_consumed_ = false;
   bool lib_reconnect_pending_ = false;
   uint32_t lib_pending_ticks_ = 0;
+  // per-tick ラッチ: この tick の drainEvents() 内で pending→GotIp が完結した
+  // ことを示す。tick() の quiet 判定で読み出した直後に必ずリセットされる
+  // (ゲート2レビュー(2回目)指摘1対応、詳細は tick()/drainEvents() のコメント)。
+  bool lib_reconnect_completed_in_drain_ = false;
 
   // abort 状態機械
   bool aborting_ = false;

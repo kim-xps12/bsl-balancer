@@ -31,6 +31,7 @@ _UINT32_REBOOT_THRESHOLD = 1 << 31
 # rank summary.json's recommended_windows).
 _WINDOW_PRIORITY = (
     "reboot",
+    "reboot_lead_in",
     "control_task_stall",
     "fault_transition",
     "loss",
@@ -474,14 +475,51 @@ def build_recommended_windows(
     Ranks by event-type priority (reboot/stall/fault first, then loss,
     then saturation/i2t/fsm), widening each event's seq span by `margin` on
     both sides so the raw excerpt includes some lead-in/lead-out context.
-    Each window carries the source event's `epoch` (指摘3: report.py needs
-    it to excerpt raw.jsonl records from the correct reboot segment, since
-    `seq` alone can collide across a reboot boundary).
+    Each window carries the source event's `epoch` (指摘3 originally: report.py
+    needs it to excerpt raw.jsonl records from the correct reboot segment,
+    since `seq` alone can collide across a reboot boundary).
+
+    A `reboot` event is a special cross-epoch case (ゲート2レビュー(2回目)
+    指摘3): its own `seq`/`epoch` describe only the *post*-reboot side, so a
+    single window built the generic way never shows any pre-reboot context.
+    For reboot events this emits *two* windows -- the usual post-reboot one
+    plus a `reboot_lead_in` window anchored on `prev_seq` in the preceding
+    epoch -- so an agent reading recommended_windows always sees the cycles
+    immediately leading up to the reboot, not just the fresh restart at
+    seq 1. The lead-in half is only emitted when the event carries a real
+    (>=1) epoch; a hand-crafted reboot event with no "epoch" field has no
+    reliable pre-reboot epoch to anchor on and yields just the one window
+    (kept for backward compatibility with pre-existing callers/tests that
+    build reboot events without an epoch).
     """
     windows: List[Dict[str, Any]] = []
     for event in events:
         if event["type"] == "fault_transition" and not event.get("to"):
             continue  # only flag transitions INTO a fault, not recovery to 0
+        if event["type"] == "reboot":
+            epoch = event.get("epoch", 0)
+            seq = event["seq"]
+            windows.append(
+                {
+                    "label": "reboot",
+                    "epoch": epoch,
+                    "start_seq": max(0, seq - margin),
+                    "end_seq": seq + margin,
+                    "severity": event.get("severity", "info"),
+                }
+            )
+            if epoch >= 1:
+                prev_seq = event["prev_seq"]
+                windows.append(
+                    {
+                        "label": "reboot_lead_in",
+                        "epoch": epoch - 1,
+                        "start_seq": max(0, prev_seq - margin),
+                        "end_seq": prev_seq + margin,
+                        "severity": event.get("severity", "info"),
+                    }
+                )
+            continue
         if "start_seq" in event:
             start, end = event["start_seq"], event["end_seq"]
         elif "seq" in event:

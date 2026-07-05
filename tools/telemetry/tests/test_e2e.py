@@ -27,6 +27,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -210,6 +211,61 @@ class InvalidPacketRejectionTests(unittest.TestCase):
         rejected = harness.receiver._pre_session_rejected
         self.assertEqual(rejected["total"], 1)
         self.assertIn("json_error", rejected["by_reason"])
+
+
+class RejectedPacketIdleTimeoutTests(unittest.TestCase):
+    """ゲート2レビュー(2回目)指摘2: only *accepted* packets may anchor the
+    idle clock. If a rejected datagram (e.g. an IP-pinning mismatch) also
+    refreshed last_activity_monotonic, a noisy rejected source arriving
+    more often than idle_timeout_s could keep a session open indefinitely
+    even after the real device has gone silent, so summary.json would never
+    be finalized.
+
+    Uses direct `_handle_datagram`/`_check_idle` calls (no background
+    `serve_forever` thread) plus a mocked `time.monotonic` for deterministic
+    time injection, per the module docstring's noted idiom for tests that
+    need to bypass the socket layer.
+    """
+
+    def test_rejected_packets_do_not_delay_idle_close(self):
+        tmp_dir = tempfile.mkdtemp(prefix="bsl_telemetry_reject_idle_")
+        self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
+        log_root = Path(tmp_dir) / "telemetry"
+
+        recv = receiver_mod.TelemetryReceiver(port=0, log_root=log_root, idle_timeout_s=5.0, poll_interval_s=0.01)
+        self.addCleanup(recv._sock.close)  # no serve_forever() running to do this for us
+
+        payload = json.dumps(simulator.PacketSequenceBuilder().full_packet()).encode("utf-8")
+
+        fake_now = [1000.0]
+        with mock.patch("bsl_telemetry.receiver.time.monotonic", side_effect=lambda: fake_now[0]):
+            # The sole accepted packet (pinned source) starts the session and
+            # anchors last_activity_monotonic at t=1000.0.
+            recv._handle_datagram(payload, "127.0.0.1")
+            self.assertIsNotNone(recv.session)
+            self.assertEqual(recv.session.last_activity_monotonic, 1000.0)
+
+            # Flood rejected packets from an unpinned source at a 1s cadence
+            # (far below idle_timeout_s=5s) for 5 iterations, spanning
+            # exactly idle_timeout_s of elapsed time since the sole accepted
+            # packet, while the pinned source stays silent throughout. Under
+            # the bug, each rejection would refresh the idle clock and the
+            # session would never observe 5s of accepted-silence.
+            for _ in range(5):
+                fake_now[0] += 1.0
+                recv._handle_datagram(payload, "203.0.113.9")
+                recv._check_idle()
+
+            self.assertIsNone(recv.session)
+            self.assertEqual(len(recv.closed_sessions), 1)
+
+        session_dir = recv.closed_sessions[0]
+        metadata = json.loads((session_dir / "metadata.json").read_text(encoding="utf-8"))
+        # The session still saw (and tallied) the reject traffic; it just
+        # must not have been kept alive by it.
+        self.assertEqual(metadata["packet_count"], 1)
+        self.assertEqual(metadata["rejected_packets"]["total"], 5)
+        self.assertEqual(metadata["rejected_packets"]["by_reason"].get("ip_pinning_mismatch"), 5)
 
 
 if __name__ == "__main__":

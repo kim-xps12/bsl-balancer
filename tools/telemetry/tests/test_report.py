@@ -117,5 +117,38 @@ class RenderReportRebootExcerptTests(unittest.TestCase):
         self.assertNotIn("epoch", markdown)
 
 
+class RebootLeadInWindowReportTests(unittest.TestCase):
+    """ゲート2レビュー(2回目)指摘3: recommended_windows for a reboot must
+    include a pre-reboot lead-in window (prev_seq, in the OLD epoch), and
+    report.py's existing epoch-scoped raw excerpt (指摘3 original) must
+    render it showing the actual pre-reboot packets."""
+
+    def test_reboot_recommended_windows_include_lead_in_and_report_renders_it(self):
+        builder = simulator.PacketSequenceBuilder()
+        packets = [builder.full_packet(sat=True) for _ in range(3)]  # seq 1,2,3, pre-reboot marker
+        builder.reboot()
+        # Post-reboot packets deliberately collide on seq with the
+        # pre-reboot ones; theta=99.0 is a marker absent pre-reboot.
+        packets.extend(builder.full_packet(theta=99.0) for _ in range(3))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session_dir = Path(tmp) / "session"
+            write_session(session_dir, packets)
+            result = analyzer.analyze_session(session_dir, write=True)
+
+            lead_in_windows = [w for w in result["summary"]["recommended_windows"] if w["label"] == "reboot_lead_in"]
+            self.assertEqual(len(lead_in_windows), 1)
+            self.assertEqual(lead_in_windows[0]["epoch"], 0)  # pre-reboot epoch
+
+            markdown = report.render_report(session_dir)
+
+        excerpt = _excerpt_block(markdown, "### reboot_lead_in")
+        # The lead-in window's excerpt must show the PRE-reboot packets
+        # (sat=True marker), never a same-seq post-reboot packet
+        # (theta=99.0 marker) that happens to collide on seq.
+        self.assertIn('"sat": true', excerpt)
+        self.assertNotIn("99.0", excerpt)
+
+
 if __name__ == "__main__":
     unittest.main()
