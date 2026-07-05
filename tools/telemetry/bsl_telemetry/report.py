@@ -16,8 +16,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from bsl_telemetry import analyzer
+else:
+    from . import analyzer
 
 DT_H_BIN_LABELS = ("<1.02x", "<1.05x", "<1.1x", "<1.2x", "<1.3x", "<1.5x", "<2.0x", ">=2.0x")
 
@@ -39,33 +46,55 @@ def load_jsonl(path: Path) -> List[Dict[str, Any]]:
     return items
 
 
-def load_raw_index_by_seq(raw_path: Path) -> Dict[int, Dict[str, Any]]:
-    index: Dict[int, Dict[str, Any]] = {}
-    for record in load_jsonl(raw_path):
+def load_raw_index_by_epoch_seq(raw_path: Path) -> Dict[Tuple[int, int], Dict[str, Any]]:
+    """Index raw.jsonl records by (reboot_epoch, seq) rather than `seq` alone.
+
+    Firmware `seq` restarts at 1 after a reboot, so a session with a reboot
+    has duplicate seq values across epochs. Keying a flat `seq`-only dict
+    would let a same-seq post-reboot record silently overwrite the
+    pre-reboot one (指摘3), which then made recommended-window excerpts for
+    a *pre-reboot* event show *post-reboot* packets. Epochs are derived with
+    analyzer.assign_reboot_epochs() -- the exact same predicate
+    analyze_records() uses to tag events.jsonl/summary.json -- so this index
+    always agrees with which record belongs to which epoch (指摘2 design).
+    """
+    records = load_jsonl(raw_path)
+    epochs = analyzer.assign_reboot_epochs(records)
+    index: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for record, epoch in zip(records, epochs):
         seq = record.get("packet", {}).get("seq")
         if seq is not None:
-            index[seq] = record
+            index[(epoch, seq)] = record
     return index
 
 
 def _format_event_span(event: Dict[str, Any]) -> str:
+    # Only call out the epoch when non-zero (i.e. a reboot has occurred) so
+    # the common single-epoch session's report stays uncluttered.
+    prefix = f"epoch {event['epoch']}, " if event.get("epoch") else ""
     if "start_seq" in event:
-        return f"seq {event['start_seq']}-{event['end_seq']}"
+        return f"{prefix}seq {event['start_seq']}-{event['end_seq']}"
     if "seq" in event:
-        return f"seq {event['seq']}"
+        return f"{prefix}seq {event['seq']}"
     return ""
 
 
 def _format_event_extra(event: Dict[str, Any]) -> str:
-    extra = {k: v for k, v in event.items() if k not in ("type", "severity", "start_seq", "end_seq", "seq")}
+    extra = {k: v for k, v in event.items() if k not in ("type", "severity", "start_seq", "end_seq", "seq", "epoch")}
     return json.dumps(extra, sort_keys=True) if extra else ""
 
 
 def _raw_excerpt(
-    raw_index: Dict[int, Dict[str, Any]], start_seq: int, end_seq: int, limit: int
+    raw_index: Dict[Tuple[int, int], Dict[str, Any]], epoch: int, start_seq: int, end_seq: int, limit: int
 ) -> List[Dict[str, Any]]:
-    seqs = sorted(seq for seq in raw_index if start_seq <= seq <= end_seq)[:limit]
-    return [raw_index[seq] for seq in seqs]
+    """Excerpt raw packets for one (epoch, seq-range) window.
+
+    Restricting the lookup to the window's own `epoch` (指摘3) is what keeps
+    a pre-reboot saturation/stall window's excerpt from showing a
+    post-reboot packet that happens to share the same (restarted) seq.
+    """
+    seqs = sorted(seq for (ep, seq) in raw_index if ep == epoch and start_seq <= seq <= end_seq)[:limit]
+    return [raw_index[(epoch, seq)] for seq in seqs]
 
 
 def render_report(session_dir: Path, raw_excerpt_limit: int = 20) -> str:
@@ -161,14 +190,16 @@ def render_report(session_dir: Path, raw_excerpt_limit: int = 20) -> str:
     if not windows:
         lines.append("(none)")
     else:
-        raw_index = load_raw_index_by_seq(session_dir / "raw.jsonl")
+        raw_index = load_raw_index_by_epoch_seq(session_dir / "raw.jsonl")
         for window in windows:
+            epoch = window.get("epoch", 0)
+            epoch_label = f"epoch {epoch}, " if epoch else ""
             lines.append(
                 f"### {window.get('label')} "
-                f"[seq {window.get('start_seq')}-{window.get('end_seq')}] "
+                f"[{epoch_label}seq {window.get('start_seq')}-{window.get('end_seq')}] "
                 f"({window.get('severity')})"
             )
-            excerpt = _raw_excerpt(raw_index, window["start_seq"], window["end_seq"], raw_excerpt_limit)
+            excerpt = _raw_excerpt(raw_index, epoch, window["start_seq"], window["end_seq"], raw_excerpt_limit)
             if excerpt:
                 lines.append("```jsonl")
                 lines.extend(json.dumps(record["packet"], sort_keys=True) for record in excerpt)

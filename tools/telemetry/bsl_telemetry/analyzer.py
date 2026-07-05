@@ -95,12 +95,20 @@ def load_metadata(session_dir: Path) -> Dict[str, Any]:
 
 
 def _region_tracker_update(
-    state: Optional[Tuple[int, int]], active: bool, seq: int, event_type: str, events: List[Dict[str, Any]]
+    state: Optional[Tuple[int, int]],
+    active: bool,
+    seq: int,
+    epoch: int,
+    event_type: str,
+    events: List[Dict[str, Any]],
 ) -> Optional[Tuple[int, int]]:
     """Track a contiguous run of `active == True` over ordered full packets.
 
     `state` is (start_seq, last_true_seq) or None. Appends a closed-region
     event to `events` the moment the run ends. Returns the updated state.
+    `epoch` tags the closed event with its reboot epoch (see
+    assign_reboot_epochs) so events sort correctly across a reboot boundary
+    even though `seq` restarts from 1 (指摘2/3).
     """
     if active:
         if state is None:
@@ -111,6 +119,7 @@ def _region_tracker_update(
             {
                 "type": event_type,
                 "severity": "warn",
+                "epoch": epoch,
                 "start_seq": state[0],
                 "end_seq": state[1],
             }
@@ -118,16 +127,95 @@ def _region_tracker_update(
     return None
 
 
+def _close_open_regions(
+    events: List[Dict[str, Any]],
+    epoch: int,
+    sat_region: Optional[Tuple[int, int]],
+    i2t_region: Optional[Tuple[int, int]],
+    loop_stall_start: Optional[int],
+    prev_full: Optional[Dict[str, Any]],
+) -> None:
+    """Close any still-open saturation/i2t/control-task-stall region as an event.
+
+    Used both (a) when a reboot is detected mid-session -- so an episode
+    that was still in progress right before the reboot is reported instead
+    of silently discarded when the baselines are reset (指摘1: without
+    this, only the reboot event would show up and the pre-reboot
+    saturation/i2t/stall precursor would vanish) -- and (b) at the very end
+    of the session, for a region that is still open when records run out.
+    `epoch` should be the epoch the open region belongs to (the pre-reboot
+    epoch in case (a), the final epoch in case (b)).
+    """
+    if sat_region is not None:
+        events.append(
+            {"type": "saturation", "severity": "warn", "epoch": epoch, "start_seq": sat_region[0], "end_seq": sat_region[1]}
+        )
+    if i2t_region is not None:
+        events.append(
+            {"type": "i2t", "severity": "warn", "epoch": epoch, "start_seq": i2t_region[0], "end_seq": i2t_region[1]}
+        )
+    if loop_stall_start is not None and prev_full is not None:
+        events.append(
+            {
+                "type": "control_task_stall",
+                "severity": "error",
+                "epoch": epoch,
+                "start_seq": loop_stall_start,
+                "end_seq": prev_full["seq"],
+            }
+        )
+
+
+def assign_reboot_epochs(records: Sequence[Dict[str, Any]]) -> List[int]:
+    """Return the reboot epoch (0-based, incremented once per detected
+    reboot) for each record in `records`, aligned by position.
+
+    A "reboot" here is exactly the condition analyze_records() uses to
+    re-anchor its baselines: a uint32-wrap-aware backward jump in `seq`, or
+    a backward jump in `t_us`. Firmware `seq` restarts at 1 after a reboot
+    while the receiver keeps appending to the same session, so `seq` alone
+    is not a safe ordering/keying key once a reboot has occurred (指摘2:
+    events.jsonl/report ordering, 指摘3: report.py raw excerpt keying).
+    Exposed as a standalone helper (rather than inlined only in
+    analyze_records) so report.py can independently derive the same epoch
+    for raw.jsonl records without analyzer.py and report.py ever
+    disagreeing on where a reboot boundary falls.
+    """
+    epochs: List[int] = []
+    epoch = 0
+    prev_seq: Optional[int] = None
+    prev_t_us: Optional[int] = None
+    for record in records:
+        packet = record["packet"]
+        seq = packet["seq"]
+        t_us = packet["t_us"]
+        is_reboot = False
+        if prev_seq is not None and _uint32_forward_delta(prev_seq, seq) is None:
+            is_reboot = True
+        if prev_t_us is not None and t_us < prev_t_us:
+            is_reboot = True
+        if is_reboot:
+            epoch += 1
+        epochs.append(epoch)
+        prev_seq = seq
+        prev_t_us = t_us
+    return epochs
+
+
 def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """Compute events + summary fields from a list of raw.jsonl records.
 
     Pure function: no I/O, deterministic given `records`. Returns a dict
     with an "events" key (list, unsorted-by-caller-safe: already sorted by
-    seq/start_seq) plus assorted summary fields that callers merge with
-    session metadata (device_id, firmware, rejected_packets, ...).
+    reboot epoch then seq/start_seq -- see assign_reboot_epochs -- so the
+    chronological order survives a firmware reboot restarting `seq` at 1,
+    指摘2) plus assorted summary fields that callers merge with session
+    metadata (device_id, firmware, rejected_packets, ...).
     """
     events: List[Dict[str, Any]] = []
     loss_events: List[Dict[str, Any]] = []
+    epochs = assign_reboot_epochs(records)
+    epoch = 0
 
     variant_counts = {"full": 0, "diagnostic": 0}
     diagnostic_by_reason = {"read_fail": 0, "trunc": 0}
@@ -167,7 +255,7 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     prev_dev: Optional[str] = None
     prev_fw: Optional[str] = None
 
-    for record in records:
+    for record_idx, record in enumerate(records):
         packet = record["packet"]
         seq = packet["seq"]
         tick = packet["tick"]
@@ -177,13 +265,7 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         variant = "full" if packet.get("snap_valid") else "diagnostic"
         variant_counts[variant] += 1
         tick_seq_gaps.append(tick - seq)
-
-        if prev_dev is not None and dev != prev_dev:
-            events.append({"type": "device_change", "severity": "error", "seq": seq, "from": prev_dev, "to": dev})
-        if prev_fw is not None and fw != prev_fw:
-            events.append({"type": "firmware_change", "severity": "warn", "seq": seq, "from": prev_fw, "to": fw})
-        prev_dev = dev
-        prev_fw = fw
+        epoch = epochs[record_idx]
 
         is_reboot = False
         if prev_seq is not None:
@@ -197,6 +279,7 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                     {
                         "type": "loss",
                         "severity": "warn",
+                        "epoch": epoch,
                         "start_seq": prev_seq,
                         "end_seq": seq,
                         "lost_packets": lost,
@@ -207,10 +290,18 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
         if is_reboot:
             reboot_count += 1
+            # 指摘1: close any region that was still open right before the
+            # reboot -- tagged with the *pre-reboot* epoch, since it belongs
+            # to the segment that is about to be discarded below -- before
+            # the baselines are reset. Otherwise a saturation/i2t/stall
+            # episode in progress at the moment of the reboot silently
+            # vanishes and only the reboot itself gets reported.
+            _close_open_regions(events, epochs[record_idx - 1], sat_region, i2t_region, loop_stall_start, prev_full)
             events.append(
                 {
                     "type": "reboot",
                     "severity": "error",
+                    "epoch": epoch,
                     "seq": seq,
                     "prev_seq": prev_seq,
                     "t_us": t_us,
@@ -229,6 +320,21 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
         prev_seq = seq
         prev_t_us = t_us
+
+        # dev/fw change detection happens after the reboot handling above so
+        # a change observed on the very first post-reboot packet is tagged
+        # with the new epoch (its `seq` belongs to the post-reboot
+        # numbering, 指摘2).
+        if prev_dev is not None and dev != prev_dev:
+            events.append(
+                {"type": "device_change", "severity": "error", "epoch": epoch, "seq": seq, "from": prev_dev, "to": dev}
+            )
+        if prev_fw is not None and fw != prev_fw:
+            events.append(
+                {"type": "firmware_change", "severity": "warn", "epoch": epoch, "seq": seq, "from": prev_fw, "to": fw}
+            )
+        prev_dev = dev
+        prev_fw = fw
 
         read_fail = packet["read_fail"]
         trunc = packet["trunc"]
@@ -251,12 +357,15 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         fsm = packet["fsm"]
         fault = packet["fault"]
         if prev_fsm is not None and fsm != prev_fsm:
-            events.append({"type": "fsm_transition", "severity": "info", "seq": seq, "from": prev_fsm, "to": fsm})
+            events.append(
+                {"type": "fsm_transition", "severity": "info", "epoch": epoch, "seq": seq, "from": prev_fsm, "to": fsm}
+            )
         if prev_fault is not None and fault != prev_fault:
             events.append(
                 {
                     "type": "fault_transition",
                     "severity": "warn" if fault else "info",
+                    "epoch": epoch,
                     "seq": seq,
                     "from": prev_fault,
                     "to": fault,
@@ -265,8 +374,8 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         prev_fsm = fsm
         prev_fault = fault
 
-        sat_region = _region_tracker_update(sat_region, packet["sat"], seq, "saturation", events)
-        i2t_region = _region_tracker_update(i2t_region, packet["i2t"], seq, "i2t", events)
+        sat_region = _region_tracker_update(sat_region, packet["sat"], seq, epoch, "saturation", events)
+        i2t_region = _region_tracker_update(i2t_region, packet["i2t"], seq, epoch, "i2t", events)
 
         loop = packet["loop"]
         dt_h = packet["dt_h"]
@@ -277,10 +386,10 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             loop_delta = _uint32_forward_delta(prev_full["loop"], loop)
             if loop_delta is not None:
                 dt_h_intervals += 1
-                for i in range(DT_H_LEN):
-                    bin_delta = _uint32_forward_delta(prev_full["dt_h"][i], dt_h[i])
+                for bin_idx in range(DT_H_LEN):
+                    bin_delta = _uint32_forward_delta(prev_full["dt_h"][bin_idx], dt_h[bin_idx])
                     if bin_delta is not None:
-                        dt_h_totals[i] += bin_delta
+                        dt_h_totals[bin_idx] += bin_delta
                 ovr_delta = _uint32_forward_delta(prev_full["ovr"], ovr)
                 if ovr_delta is not None:
                     ovr_total_delta += ovr_delta
@@ -296,6 +405,7 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                         {
                             "type": "control_task_stall",
                             "severity": "error",
+                            "epoch": epoch,
                             "start_seq": loop_stall_start,
                             "end_seq": prev_full["seq"],
                         }
@@ -305,22 +415,10 @@ def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         prev_full = {"seq": seq, "loop": loop, "dt_h": list(dt_h), "ovr": ovr, "stale": stale}
 
     # Close out any regions still open at the end of the session.
-    if sat_region is not None:
-        events.append({"type": "saturation", "severity": "warn", "start_seq": sat_region[0], "end_seq": sat_region[1]})
-    if i2t_region is not None:
-        events.append({"type": "i2t", "severity": "warn", "start_seq": i2t_region[0], "end_seq": i2t_region[1]})
-    if loop_stall_start is not None and prev_full is not None:
-        events.append(
-            {
-                "type": "control_task_stall",
-                "severity": "error",
-                "start_seq": loop_stall_start,
-                "end_seq": prev_full["seq"],
-            }
-        )
+    _close_open_regions(events, epoch, sat_region, i2t_region, loop_stall_start, prev_full)
 
     events.extend(loss_events)
-    events.sort(key=lambda e: e.get("start_seq", e.get("seq", 0)))
+    events.sort(key=lambda e: (e.get("epoch", 0), e.get("start_seq", e.get("seq", 0))))
 
     total_expected = variant_counts["full"] + variant_counts["diagnostic"] + lost_estimate
     loss_rate = (lost_estimate / total_expected) if total_expected > 0 else 0.0
@@ -376,6 +474,9 @@ def build_recommended_windows(
     Ranks by event-type priority (reboot/stall/fault first, then loss,
     then saturation/i2t/fsm), widening each event's seq span by `margin` on
     both sides so the raw excerpt includes some lead-in/lead-out context.
+    Each window carries the source event's `epoch` (指摘3: report.py needs
+    it to excerpt raw.jsonl records from the correct reboot segment, since
+    `seq` alone can collide across a reboot boundary).
     """
     windows: List[Dict[str, Any]] = []
     for event in events:
@@ -390,6 +491,7 @@ def build_recommended_windows(
         windows.append(
             {
                 "label": event["type"],
+                "epoch": event.get("epoch", 0),
                 "start_seq": max(0, start - margin),
                 "end_seq": end + margin,
                 "severity": event.get("severity", "info"),

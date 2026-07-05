@@ -80,6 +80,98 @@ class RebootReanchorTests(unittest.TestCase):
         self.assertEqual(result["loss"]["lost_estimate"], 0)
 
 
+class RebootOpenRegionTests(unittest.TestCase):
+    """指摘1: a saturation/i2t/control_task_stall region still open at the
+    moment of a reboot must be closed and reported (using the pre-reboot
+    baseline) instead of silently discarded by the baseline reset."""
+
+    def test_saturation_region_open_at_reboot_is_closed_not_dropped(self):
+        builder = simulator.PacketSequenceBuilder()
+        packets = [builder.full_packet(sat=True) for _ in range(3)]  # seq 1,2,3, still open
+        pre_reboot_start_seq = packets[0]["seq"]
+        pre_reboot_end_seq = packets[-1]["seq"]
+
+        builder.reboot()
+        # Post-reboot seq restarts at 1, colliding with the pre-reboot seq
+        # values above; sat is back to the default False.
+        packets.extend(builder.full_packet() for _ in range(2))
+
+        result = analyzer.analyze_records(wrap_records(packets))
+        self.assertEqual(result["reboot_count"], 1)
+        sat_events = [e for e in result["events"] if e["type"] == "saturation"]
+        # The pre-reboot saturation region must be reported, not merged into
+        # a bogus cross-reboot span and not silently dropped.
+        self.assertEqual(len(sat_events), 1)
+        self.assertEqual(sat_events[0]["start_seq"], pre_reboot_start_seq)
+        self.assertEqual(sat_events[0]["end_seq"], pre_reboot_end_seq)
+
+    def test_control_task_stall_open_at_reboot_is_closed_not_dropped(self):
+        builder = simulator.PacketSequenceBuilder(samples_per_packet=10)
+        packets = [builder.full_packet() for _ in range(2)]
+        pre_stall_seq = packets[-1]["seq"]  # last packet before loop progress stops
+        stalled_loop = packets[-1]["loop"]
+
+        stalled = builder.full_packet()
+        stalled["loop"] = stalled_loop  # ControlTask stall begins, still open at reboot
+        packets.append(stalled)
+        stalled_seq = stalled["seq"]
+
+        builder.reboot()
+        packets.extend(builder.full_packet() for _ in range(2))  # post-reboot resumes normally
+
+        result = analyzer.analyze_records(wrap_records(packets))
+        self.assertEqual(result["reboot_count"], 1)
+        stalls = [e for e in result["events"] if e["type"] == "control_task_stall"]
+        self.assertEqual(len(stalls), 1)
+        self.assertEqual(stalls[0]["start_seq"], pre_stall_seq)
+        self.assertEqual(stalls[0]["end_seq"], stalled_seq)
+
+
+class RebootEventOrderingTests(unittest.TestCase):
+    """指摘2: firmware `seq` restarts at 1 after a reboot while the receiver
+    keeps appending to the same session, so events must sort by reboot
+    epoch first (falling back to seq only within an epoch) -- not by raw
+    `seq` alone, which would put a post-reboot event with a small seq ahead
+    of a pre-reboot event with a larger seq."""
+
+    def test_events_ordered_by_reboot_epoch_not_raw_seq(self):
+        builder = simulator.PacketSequenceBuilder(fw="aaaaaaa")
+        packets = [builder.full_packet() for _ in range(3)]  # seq 1,2,3
+        packets.append(builder.full_packet(sat=True))  # seq 4, sat opens (still open at reboot)
+        pre_reboot_open_seq = packets[-1]["seq"]
+
+        builder.reboot()
+        # Post-reboot firmware differs -> firmware_change fires on the very
+        # first post-reboot packet, whose seq (1) is numerically smaller
+        # than the pre-reboot saturation region's seq (4) above.
+        packets.append(builder.full_packet(fw="bbbbbbb"))
+        post_reboot_small_seq = packets[-1]["seq"]
+        self.assertLess(post_reboot_small_seq, pre_reboot_open_seq)
+
+        result = analyzer.analyze_records(wrap_records(packets))
+        events = result["events"]
+        sat_idx = next(i for i, e in enumerate(events) if e["type"] == "saturation")
+        reboot_idx = next(i for i, e in enumerate(events) if e["type"] == "reboot")
+        fw_change_idx = next(i for i, e in enumerate(events) if e["type"] == "firmware_change")
+
+        # A naive seq-only sort would put firmware_change (seq=1) first.
+        # The actual chronological order is: pre-reboot saturation, then the
+        # reboot itself, then the post-reboot firmware_change.
+        self.assertLess(sat_idx, reboot_idx)
+        self.assertLess(reboot_idx, fw_change_idx)
+        self.assertEqual(events[sat_idx]["epoch"], 0)
+        self.assertEqual(events[reboot_idx]["epoch"], 1)
+        self.assertEqual(events[fw_change_idx]["epoch"], 1)
+
+    def test_assign_reboot_epochs_matches_analyze_records_reboot_count(self):
+        packets = simulator.generate_scenario("reboot", count=10)
+        records = wrap_records(packets)
+        epochs = analyzer.assign_reboot_epochs(records)
+        result = analyzer.analyze_records(records)
+        self.assertEqual(epochs[-1], result["reboot_count"])
+        self.assertEqual(epochs[0], 0)
+
+
 class DtHistogramOvrStaleTests(unittest.TestCase):
     def test_dt_h_ovr_stale_diffs_reconstructed_across_interval(self):
         builder = simulator.PacketSequenceBuilder(samples_per_packet=10)

@@ -1084,6 +1084,89 @@ static void test_wifi_guard_lib_reconnect_during_arm_pending_aborts_once() {
   TEST_ASSERT_EQUAL(1, st.disconnect_calls);  // ちょうど1回
 }
 
+// ---------------- WifiGuard: abort/radio-off 中の遅延 GOT_IP (ゲート2レビュー指摘4) ----------------
+// abort/radio-off 進行中にライブラリの遅延 GOT_IP イベントが drain されると
+// connected_ が true に戻り得るが、この窓では abort-class 操作のみ許可されるため
+// readyToAttempt()/trySend() は false/NotConnected を維持しなければならない。
+
+static void test_wifi_guard_delayed_got_ip_during_abort_blocks_send() {
+  FakeWifiState st;
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  p.abort_confirm_ticks = 3;
+  WifiGuard g(makeFakeOps(&st), p);
+  const uint8_t payload[4] = {1, 2, 3, 4};
+
+  // 通常接続 + prewarm 成功 (udp_ready_ = true) にしておく。
+  g.tick(true, 1, false, false);
+  g.tick(true, 2, false, false);  // begin -> connecting_
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 3, false, false);
+  TEST_ASSERT_TRUE(g.connected());
+  TEST_ASSERT_EQUAL(static_cast<int>(WifiGuard::SendOutcome::Sent),
+                    static_cast<int>(g.trySend(payload, sizeof(payload))));
+  TEST_ASSERT_TRUE(g.udpReady());
+
+  // Idle 中に AP を一時喪失 (非自発的切断) -> ライブラリ one-shot 再接続が
+  // in-flight になり (lib_reconnect_pending_)、かつ同一 tick で Balancing へ
+  // 遷移 (WIFI_QUIET 成立) させて abort を開始させる。reconnect_backoff_ticks=0
+  // のまま quiet が成立しない tick を挟むと、guard 自身の begin() 再発行 (ライフ
+  // サイクル条件 (d)) が同一 tick 内で lib_reconnect_pending_ を消してしまう
+  // (test_wifi_guard_lib_reconnect_idle_resolves_then_arm_no_abort のコメント
+  // 参照) ため、one-shot 発火と WIFI_QUIET 成立を同一 tick に揃える。
+  g.pushEvent(WifiGuard::EventKind::StaDisconnected, /*reason=*/1);
+  g.tick(true, 4, /*balancing=*/true, false);
+  TEST_ASSERT_TRUE(g.aborting());
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);
+  TEST_ASSERT_FALSE(g.connected());
+
+  // abort 完了確認 (ASSOC_LEAVE / STA_STOP) が届く前に、ライブラリ側の遅延
+  // GOT_IP が drain される (in-flight one-shot が実は成功していたレース)。
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 5, true, false);
+  TEST_ASSERT_TRUE(g.connected());  // バグの温床: connected_ は true に戻る
+  TEST_ASSERT_TRUE(g.aborting());   // abort はまだ進行中 (確認イベント未到着)
+  TEST_ASSERT_EQUAL(1, st.disconnect_calls);  // 追加の disconnect は発行されない
+
+  // それでも送信は一切許可されない (abort-class 操作のみが許される窓)。
+  TEST_ASSERT_FALSE(g.readyToAttempt());
+  const WifiGuard::SendOutcome o = g.trySend(payload, sizeof(payload));
+  TEST_ASSERT_EQUAL(static_cast<int>(WifiGuard::SendOutcome::NotConnected), static_cast<int>(o));
+  TEST_ASSERT_EQUAL(1, st.begin_packet_calls);  // 直前の成功送信の1回のみ (再試行なし)
+}
+
+static void test_wifi_guard_delayed_got_ip_during_radio_off_pending_blocks_send() {
+  FakeWifiState st;
+  st.disconnect_return = false;  // disconnect() を常に失敗させ、retry 上限到達を強制する
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  p.abort_confirm_ticks = 1;
+  p.abort_max_retries = 1;
+  WifiGuard g(makeFakeOps(&st), p);
+  const uint8_t payload[4] = {1, 2, 3, 4};
+
+  g.tick(true, 1, false, false);
+  g.tick(true, 2, false, false);  // begin -> connecting_
+  g.tick(true, 3, true, false);   // Balancing -> abort 開始 (1回目、失敗)
+  TEST_ASSERT_TRUE(g.aborting());
+  g.tick(true, 4, true, false);   // リトライ (まだ失敗)
+  TEST_ASSERT_TRUE(g.aborting());
+  g.tick(true, 5, true, false);   // リトライ上限到達 -> radio off pending へ
+  TEST_ASSERT_FALSE(g.aborting());
+  TEST_ASSERT_TRUE(g.radioOffPending());
+
+  // radio 停止確認前に遅延 GOT_IP が drain される。
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 6, true, false);
+  TEST_ASSERT_TRUE(g.connected());       // バグの温床
+  TEST_ASSERT_TRUE(g.radioOffPending());  // 停止確認はまだ
+
+  TEST_ASSERT_FALSE(g.readyToAttempt());
+  const WifiGuard::SendOutcome o = g.trySend(payload, sizeof(payload));
+  TEST_ASSERT_EQUAL(static_cast<int>(WifiGuard::SendOutcome::NotConnected), static_cast<int>(o));
+  TEST_ASSERT_EQUAL(0, st.begin_packet_calls);
+}
+
 // ---------------- WifiGuard: prewarm / udp_ready (計画書 §3.1) ----------------
 
 static void test_wifi_guard_prewarm_beginpacket_failure_blocks_write() {
@@ -1323,6 +1406,8 @@ int main(int, char**) {
   RUN_TEST(test_wifi_guard_lib_reconnect_idle_resolves_then_arm_no_abort);
   RUN_TEST(test_wifi_guard_lib_reconnect_one_shot_failure_clears_pending);
   RUN_TEST(test_wifi_guard_lib_reconnect_during_arm_pending_aborts_once);
+  RUN_TEST(test_wifi_guard_delayed_got_ip_during_abort_blocks_send);
+  RUN_TEST(test_wifi_guard_delayed_got_ip_during_radio_off_pending_blocks_send);
   RUN_TEST(test_wifi_guard_prewarm_beginpacket_failure_blocks_write);
   RUN_TEST(test_wifi_guard_prewarm_withheld_during_arm_pending);
   RUN_TEST(test_wifi_guard_endpacket_failure_keeps_udp_ready_during_balancing);

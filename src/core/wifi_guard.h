@@ -170,7 +170,12 @@ class WifiGuard {
   // packet 送信 (prewarm 兼用)。readyToAttempt()==false の間は呼び出し側がスキップして
   // よい。beginPacket が失敗したら write には絶対に進まない (tx バッファ deref のため)。
   SendOutcome trySend(const uint8_t* buf, size_t len) {
-    if (!connected_ || abort_failed_latched_) return SendOutcome::NotConnected;
+    // aborting_/radio_off_pending_ 中は connected_ が (ライブラリの遅延 GOT_IP
+    // drain により) true に見えることがあるが、この窓では abort-class 操作のみ
+    // 許可される (計画書 §3.1)。ゲートレビュー指摘4対応。
+    if (!connected_ || aborting_ || radio_off_pending_ || abort_failed_latched_) {
+      return SendOutcome::NotConnected;
+    }
 
     const int bp = ops_.beginPacket(ops_.ctx);
     if (bp == 0) {
@@ -197,7 +202,9 @@ class WifiGuard {
   // 未 ready の prewarm は !WIFI_QUIET の tick でのみ許可、ready 後は WIFI_QUIET でも
   // (Balancing 中でも) 確保済み資源の再利用として送信を継続する (計画書 §3.1)。
   bool readyToAttempt() const {
-    if (!connected_) return false;
+    // abort/radio-off 進行中に遅延 GOT_IP が drain されて connected_ が true に
+    // 戻っても、この窓では送信を試みてはならない (ゲートレビュー指摘4対応)。
+    if (!connected_ || aborting_ || radio_off_pending_) return false;
     return udp_ready_ || !last_wifi_quiet_;
   }
 
