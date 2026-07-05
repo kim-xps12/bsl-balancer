@@ -1310,6 +1310,44 @@ static void test_wifi_guard_endpacket_failure_keeps_udp_ready_during_balancing()
   TEST_ASSERT_EQUAL_UINT32(1u, g.sendFailTotal());
 }
 
+// 切断で udp_ready がリセットされ、再接続後の初回送信 (prewarm) が WIFI_QUIET 窓で
+// 通らないこと (ゲート2第3回指摘対応: stale readiness による prewarm ゲート迂回の防止)
+static void test_wifi_guard_disconnect_clears_udp_ready_blocks_quiet_send_after_reconnect() {
+  FakeWifiState st;
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  WifiGuard g(makeFakeOps(&st), p);
+
+  // 接続 → prewarm 完了 (udp_ready)
+  g.tick(true, 1, false, false);
+  g.tick(true, 2, false, false);
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 3, false, false);
+  const uint8_t payload[4] = {1, 2, 3, 4};
+  TEST_ASSERT_EQUAL(static_cast<int>(WifiGuard::SendOutcome::Sent),
+                    static_cast<int>(g.trySend(payload, sizeof(payload))));
+  TEST_ASSERT_TRUE(g.udpReady());
+
+  // 接続喪失 (自発的扱いで lib one-shot を絡めない) → readiness も無効化される
+  g.pushEvent(WifiGuard::EventKind::StaDisconnected, WifiGuard::kReasonAssocLeave);
+  g.tick(true, 4, false, false);  // drain (+ !quiet なので begin 再発行)
+  TEST_ASSERT_FALSE(g.udpReady());
+
+  // 再接続完了が WIFI_QUIET (Balancing) 中に drain されるケース:
+  // 修正前は stale な udp_ready_ により readyToAttempt() が true になっていた
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 5, /*balancing=*/true, false);
+  TEST_ASSERT_TRUE(g.connected());
+  TEST_ASSERT_FALSE(g.readyToAttempt());  // quiet 窓では prewarm を保留
+
+  // !WIFI_QUIET に戻ったら prewarm が許可される
+  g.tick(true, 6, false, false);
+  TEST_ASSERT_TRUE(g.readyToAttempt());
+  TEST_ASSERT_EQUAL(static_cast<int>(WifiGuard::SendOutcome::Sent),
+                    static_cast<int>(g.trySend(payload, sizeof(payload))));
+  TEST_ASSERT_TRUE(g.udpReady());
+}
+
 // ---------------- 統合: armPending() が Wi-Fi 接続を Balancing 前に abort する ----------------
 // (計画書 §3.1: commissioned auto-arm と BtnC 手動アームの両経路で同一機構であることの確認)
 
@@ -1483,6 +1521,7 @@ int main(int, char**) {
   RUN_TEST(test_wifi_guard_prewarm_beginpacket_failure_blocks_write);
   RUN_TEST(test_wifi_guard_prewarm_withheld_during_arm_pending);
   RUN_TEST(test_wifi_guard_endpacket_failure_keeps_udp_ready_during_balancing);
+  RUN_TEST(test_wifi_guard_disconnect_clears_udp_ready_blocks_quiet_send_after_reconnect);
   RUN_TEST(test_integration_wifi_abort_before_balancing_auto_arm);
   RUN_TEST(test_integration_wifi_abort_before_balancing_manual_arm);
   RUN_TEST(test_shared_state_concurrent_publish_read_no_torn_read);

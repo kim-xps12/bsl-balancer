@@ -291,6 +291,10 @@ class WifiGuard {
           const bool was_active = connecting_ || connected_;
           connected_ = false;
           connecting_ = false;
+          // 切断で UDP readiness も無効化する (ゲート2第3回指摘対応): これを残すと
+          // 再接続後の初回送信が stale な udp_ready_ を信用して WIFI_QUIET 窓で
+          // 通ってしまい、prewarm ゲート (!WIFI_QUIET で再 prewarm) を迂回する。
+          udp_ready_ = false;
           if (was_active && !aborting_) {
             backoff_ticks_remaining_ = p_.reconnect_backoff_ticks;
           }
@@ -318,6 +322,7 @@ class WifiGuard {
         case EventKind::StaStop:
           connected_ = false;
           connecting_ = false;
+          udp_ready_ = false;  // 切断と同様に readiness を無効化 (ゲート2第3回指摘対応)
           if (aborting_ && this_epoch > abort_epoch_) completeAbort();
           if (radio_off_pending_ && this_epoch > radio_off_epoch_) completeRadioOff();
           break;
