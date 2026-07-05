@@ -267,6 +267,84 @@ class OutOfOrderRecoveryTests(unittest.TestCase):
         self.assertEqual(result["reboot_count"], 1)
         self.assertEqual(result["out_of_order_count"], 0)
 
+    def test_recovery_accepts_candidate_exactly_at_lower_bound(self):
+        """2026-07-06 review round 10 指摘1 (boundary inclusiveness): a
+        delayed packet whose tick/t_us/loop exactly equal the gap's lower
+        bound (the last packet accepted immediately before the gap) must
+        still be recovered as out-of-order, not rejected by an off-by-one
+        bounds check."""
+        builder = simulator.PacketSequenceBuilder()
+        p1 = builder.full_packet()  # seq 1: becomes the gap's lower bound
+        builder.full_packet()  # seq 2: dropped -> "missing", delayed below
+        p3 = builder.full_packet()  # seq 3: gap detected here (anchor -> p3)
+
+        delayed = dict(p3)
+        delayed["seq"] = 2
+        delayed["tick"] = p1["tick"]
+        delayed["t_us"] = p1["t_us"]
+        delayed["loop"] = p1["loop"]
+
+        records = wrap_records([p1, p3, delayed])
+        result = analyzer.analyze_records(records)
+
+        self.assertEqual(result["reboot_count"], 0)
+        self.assertEqual([e for e in result["events"] if e["type"] == "reboot"], [])
+        self.assertEqual(result["out_of_order_count"], 1)
+        self.assertEqual(result["loss"]["lost_estimate"], 0)
+
+    def test_post_reboot_packet_reusing_missing_seq_is_reboot_not_recovery(self):
+        """2026-07-06 review round 10 指摘1: a reboot whose first *accepted*
+        post-reboot packet happens to land on the exact same seq value as a
+        still-unexplained pre-reboot gap (receive order seq 1, 3 [seq 2
+        missing] -> reboot -> post-reboot seq 2, its own seq 1 having been
+        lost) must be classified as a reboot, not silently "recovered" as
+        the pre-reboot gap's delayed datagram.
+
+        Before this fix, the missing-seq recovery check ran with no
+        same-boot validity check: it only compared the *seq* value against
+        `missing`, so a post-reboot packet reusing that exact seq number
+        looked identical to a genuinely delayed pre-reboot datagram. That
+        silently swallowed the reboot: no epoch bump, no reboot event, and
+        every downstream counter/loss figure kept using the stale
+        pre-reboot baseline.
+
+        `start_tick`/`start_loop`/`start_t_us` are seeded well above zero so
+        the pre-reboot gap's bounds are non-trivial (mirrors a real device
+        that had already been running for a while, e.g. control loop cycles
+        since power-on, before this telemetry session's packets 1/3 were
+        captured) while `reboot()` always resets tick/loop/t_us back near
+        zero -- exactly the condition the fix's [lower, upper] bounds check
+        must catch.
+        """
+        builder = simulator.PacketSequenceBuilder(
+            start_tick=100_000, start_loop=1_000_000, start_t_us=50_000_000
+        )
+        p1 = builder.full_packet()  # seq 1: gap lower bound
+        builder.full_packet()  # seq 2: dropped, gap never explained pre-reboot
+        p3 = builder.full_packet()  # seq 3: gap upper bound; missing = {2: (p1, p3)}
+
+        builder.reboot()
+        builder.full_packet()  # post-reboot seq 1: also lost, never received
+        post_seq2 = builder.full_packet()  # post-reboot seq 2: reuses the missing seq
+
+        records = wrap_records([p1, p3, post_seq2])
+        result = analyzer.analyze_records(records)
+
+        self.assertEqual(result["reboot_count"], 1)
+        reboot_events = [e for e in result["events"] if e["type"] == "reboot"]
+        self.assertEqual(len(reboot_events), 1)
+        self.assertEqual(reboot_events[0]["seq"], 2)
+        self.assertEqual(reboot_events[0]["prev_seq"], 3)
+        self.assertEqual(result["out_of_order_count"], 0)
+        # The pre-reboot gap (seq 2) is never explained by the post-reboot
+        # packet reusing its seq value and stays counted as lost -- a
+        # reboot clears the "missing" bookkeeping, it does not retroactively
+        # un-lose a pre-reboot gap (2026-07-06 review round 10 指摘1 spec).
+        self.assertEqual(result["loss"]["lost_estimate"], 1)
+
+        epochs = analyzer.assign_reboot_epochs(records)
+        self.assertEqual(epochs, [0, 0, 1])
+
 
 class DuplicateOfRecoveredOrProcessedPacketTests(unittest.TestCase):
     """2026-07-06 review round 9 指摘1: a *duplicate* of a packet that has

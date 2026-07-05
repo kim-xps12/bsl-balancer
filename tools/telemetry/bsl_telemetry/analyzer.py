@@ -155,6 +155,47 @@ def _detect_reboot(prev_packet: Optional[Dict[str, Any]], curr_packet: Dict[str,
     return False
 
 
+def _in_boot_bounds(candidate: Dict[str, Any], lower: Dict[str, Any], upper: Dict[str, Any]) -> bool:
+    """True if `candidate` could plausibly be a same-boot datagram
+    transmitted between `lower` and `upper` (2026-07-06 review round 10
+    指摘1).
+
+    `lower`/`upper` are the two packets straddling the seq gap that made
+    `candidate`'s seq value "missing" in the first place: `lower` is the
+    last in-order packet accepted immediately before the gap, `upper` is
+    the first in-order packet accepted immediately after it (see
+    `missing`'s population in `_classify_records`). Firmware emits
+    telemetry packets with monotonically increasing `tick`/`t_us` (and, for
+    full-variant packets, `loop`) within a single boot, so a genuinely
+    delayed-but-not-lost datagram from that same boot must have been
+    transmitted somewhere in between: its `tick` and `t_us` must fall
+    within [lower, upper], inclusive of both ends (a delayed packet can
+    legitimately share a bound's exact value, e.g. back-to-back sends
+    within the same microsecond tick).
+
+    A post-reboot packet that happens to reuse the same (now-stale)
+    missing seq value instead carries freshly-reset `tick`/`t_us`/`loop`
+    values that -- for any boot that had already made non-trivial forward
+    progress before the gap -- fall well below `lower`'s, and fails this
+    check. That lets the caller fall through to the ordinary reboot
+    predicate instead of misclassifying the reboot as a recovered
+    reorder.
+
+    `loop` is only present on full-variant packets, so it is checked the
+    same way but only when `candidate`, `lower` and `upper` are all
+    full-variant; a diagnostic packet on either side of the comparison
+    skips the `loop` check.
+    """
+    if not (lower["t_us"] <= candidate["t_us"] <= upper["t_us"]):
+        return False
+    if not (lower["tick"] <= candidate["tick"] <= upper["tick"]):
+        return False
+    if "loop" in candidate and "loop" in lower and "loop" in upper:
+        if not (lower["loop"] <= candidate["loop"] <= upper["loop"]):
+            return False
+    return True
+
+
 def _classify_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Classify every record (aligned by position) as reboot / recovered
     out-of-order / neither, and assign each one its reboot epoch.
@@ -175,22 +216,48 @@ def _classify_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]
     and fabricates a bogus reboot event plus a bogus loss window, even
     though nothing was actually lost or restarted.
 
-    This is resolved with a per-epoch "missing seq" set: whenever a
+    This is resolved with a per-epoch "missing seq" map: whenever a
     legitimate forward gap is observed (delta > 1), every seq number the
     gap skipped over is recorded into `missing` (capped at
     _MAX_TRACKED_MISSING_PER_GAP per gap so a huge gap cannot exhaust
     memory -- ordinary bookkeeping only, the excess is never individually
-    recoverable). If a later record's seq fails the forward-progress check
-    *and* is a member of `missing`, it is a delayed datagram from the same
-    boot: recovered as out-of-order (removed from `missing`), not a
-    reboot. A recovered record must not become the new anchor -- doing so
-    would compute the *next* record's delta against an out-of-order (too
-    small) seq instead of the last in-order one, corrupting every
-    interval/region/loss tracker that assumes receive order tracks seq
-    order (see analyze_records(), which additionally excludes out-of-order
-    records from all of those trackers).
+    recoverable), mapped to a `(lower_bound, upper_bound)` pair: the last
+    in-order packet accepted immediately before the gap, and the packet
+    that revealed the gap immediately after it. If a later record's seq
+    fails the forward-progress check *and* is a member of `missing` *and*
+    its `tick`/`t_us`/`loop` fall within that seq's recorded
+    `[lower_bound, upper_bound]` (see _in_boot_bounds, 2026-07-06 review
+    round 10 指摘1), it is a delayed datagram from the same boot: recovered
+    as out-of-order (removed from `missing`), not a reboot. A recovered
+    record must not become the new anchor -- doing so would compute the
+    *next* record's delta against an out-of-order (too small) seq instead
+    of the last in-order one, corrupting every interval/region/loss
+    tracker that assumes receive order tracks seq order (see
+    analyze_records(), which additionally excludes out-of-order records
+    from all of those trackers).
 
-    The missing-set recovery check runs *before* the general _detect_reboot
+    The `[lower_bound, upper_bound]` check (round 10 指摘1) guards against a
+    *post-reboot* packet reusing a pre-reboot gap's seq value before the
+    reboot predicate below gets a chance to fire: e.g. receive order seq 1,
+    3 (seq 2 missing, gap bounds = packet 1 .. packet 3), then a reboot
+    whose first *accepted* post-reboot packet happens to be seq 2 again
+    (its own seq 1 having been lost). Without the bounds check, that
+    post-reboot seq 2 looks exactly like the still-outstanding pre-reboot
+    seq 2 and would be silently "recovered" -- the epoch would never
+    advance, no reboot event would fire, and every counter/loss figure
+    downstream would be computed against the wrong (pre-reboot) baseline.
+    A genuinely delayed datagram from the same boot must have been
+    transmitted while `tick`/`t_us`/`loop` were between the gap's two
+    straddling packets (firmware counters only move forward within a
+    boot), so it always passes; a post-reboot packet's freshly-reset
+    counters (for any boot that had already made non-trivial progress
+    before the gap) fall outside that range and correctly fall through to
+    the reboot predicate instead. When the bounds check fails, `missing`'s
+    entry for that seq is deliberately left in place rather than removed
+    directly -- it disappears the same way every other pre-reboot entry
+    does, via the reboot boundary's `missing.clear()` below.
+
+    The missing-map recovery check runs *before* the general _detect_reboot
     predicate (a real reboot's own counters can never explain away a
     pre-reboot gap). A genuine reboot clears `missing`: none of a
     pre-reboot epoch's still-unexplained gaps can ever be "recovered" by a
@@ -244,7 +311,7 @@ def _classify_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]
     classifications: List[Dict[str, Any]] = []
     epoch = 0
     anchor: Optional[Dict[str, Any]] = None
-    missing: set = set()
+    missing: Dict[int, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
     observed: Dict[int, Dict[str, Any]] = {}
 
     for record in records:
@@ -277,12 +344,20 @@ def _classify_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]
         forward_delta = _uint32_forward_delta(anchor["seq"], seq) if anchor is not None else None
 
         if forward_delta is None and anchor is not None and seq in missing:
-            missing.discard(seq)
-            classifications.append(
-                {"epoch": epoch, "is_reboot": False, "is_out_of_order": True, "is_duplicate": False}
-            )
-            observed[seq] = packet
-            continue
+            lower_bound, upper_bound = missing[seq]
+            if _in_boot_bounds(packet, lower_bound, upper_bound):
+                del missing[seq]
+                classifications.append(
+                    {"epoch": epoch, "is_reboot": False, "is_out_of_order": True, "is_duplicate": False}
+                )
+                observed[seq] = packet
+                continue
+            # Out of bounds (2026-07-06 review round 10 指摘1): this is not
+            # the same-boot delayed datagram the gap anticipated -- its
+            # tick/t_us/loop have been reset by a reboot. Leave the stale
+            # `missing[seq]` entry as-is (it is cleared, along with the
+            # rest of `missing`, by the reboot boundary handling below) and
+            # fall through to the ordinary reboot predicate.
 
         is_reboot = _detect_reboot(anchor, packet)
         if is_reboot:
@@ -291,8 +366,9 @@ def _classify_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]
             observed.clear()
         elif anchor is not None and forward_delta is not None and forward_delta > 1:
             gap_start = (anchor["seq"] + 1) % _UINT32_MOD
+            gap_bounds = (anchor, packet)
             for i in range(min(forward_delta - 1, _MAX_TRACKED_MISSING_PER_GAP)):
-                missing.add((gap_start + i) % _UINT32_MOD)
+                missing[(gap_start + i) % _UINT32_MOD] = gap_bounds
 
         classifications.append(
             {"epoch": epoch, "is_reboot": is_reboot, "is_out_of_order": False, "is_duplicate": False}
