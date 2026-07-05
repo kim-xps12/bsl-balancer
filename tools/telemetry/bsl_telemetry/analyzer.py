@@ -124,6 +124,17 @@ def _detect_reboot(prev_packet: Optional[Dict[str, Any]], curr_packet: Dict[str,
         return True
     if seq_delta == 0:
         return True  # same seq, content differs (duplicate already ruled out above)
+    # `loop` (ControlTask cycle counter) regression between two FULL packets
+    # -> reboot (2026-07-05 review round 6). Covers the case where the first
+    # post-reboot datagram(s) were lost so seq/tick appear to move forward,
+    # and reconnect-time jitter makes the post-reboot `t_us` exceed the short
+    # pre-reboot run's `t_us`. `loop` is monotonic within a boot (uint32 wrap
+    # at 200 Hz is ~248 days, far beyond any session), so a backward delta is
+    # a reboot signal. Diagnostic packets carry no `loop`, so this check only
+    # applies when both adjacent packets are the full variant.
+    if "loop" in prev_packet and "loop" in curr_packet:
+        if _uint32_forward_delta(prev_packet["loop"], curr_packet["loop"]) is None:
+            return True
     return False
 
 

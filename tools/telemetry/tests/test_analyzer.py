@@ -138,6 +138,35 @@ class RebootReanchorTests(unittest.TestCase):
         epochs = analyzer.assign_reboot_epochs(records)
         self.assertEqual(epochs, [0, 0, 0, 0, 0])
 
+    def test_loop_rollback_with_forward_seq_tick_tus_is_reboot(self):
+        """2026-07-05 review round 6: a reboot where the first post-reboot
+        datagram(s) were lost can present seq/tick as *forward* (e.g. the
+        short pre-reboot telemetry run only reached seq=1, and the first
+        observed post-reboot packet is seq=2), and reconnect-time jitter can
+        make the post-reboot t_us exceed the short pre-reboot run's t_us.
+        The only remaining reboot signal is the `loop` (ControlTask cycle
+        counter) rollback between the two full packets: the control loop had
+        been running long before telemetry connected pre-reboot, so its
+        counter was large, and restarts small after the reboot."""
+        builder = simulator.PacketSequenceBuilder()
+        pre_reboot = builder.full_packet()  # seq=1, tick=1
+        pre_reboot["loop"] = 500_000  # control loop ran long before telemetry
+        post_reboot = builder.full_packet()  # seq=2, tick=2 (forward!)
+        post_reboot["t_us"] = pre_reboot["t_us"] + 10_000  # forward: reconnect jitter
+        post_reboot["loop"] = 400  # rolled back: control task restarted
+
+        records = wrap_records([pre_reboot, post_reboot])
+        result = analyzer.analyze_records(records)
+        self.assertEqual(result["reboot_count"], 1)
+        reboot_events = [e for e in result["events"] if e["type"] == "reboot"]
+        self.assertEqual(len(reboot_events), 1)
+        # Must not be miscounted as seq loss.
+        self.assertEqual(result["loss"]["gap_count"], 0)
+        self.assertEqual(result["loss"]["lost_estimate"], 0)
+
+        epochs = analyzer.assign_reboot_epochs(records)
+        self.assertEqual(epochs, [0, 1])
+
 
 class RebootOpenRegionTests(unittest.TestCase):
     """指摘1: a saturation/i2t/control_task_stall region still open at the
