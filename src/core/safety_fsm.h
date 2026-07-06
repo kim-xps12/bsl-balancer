@@ -78,6 +78,17 @@ class SafetyFsm {
   FaultReason faultReason() const { return fault_reason_; }
   int fallCount() const { return fall_count_; }
 
+  // Idle→Balancing 遷移保留 (直立ホールド進行中) の additive アクセサ
+  // (UDP telemetry Phase1 計画書 §3.1 で明示許可)。既存の起立ホールドカウンタ
+  // (upright_since_valid_) を読み出すのみで、遷移ロジック・タイミングは無変更。
+  // commissioned auto-arm・BtnC 手動アーム後の Idle は共に Idle 状態から同一の
+  // uprightHold() 経路を通るため、両方を区別なくカバーする。Fallen 状態は
+  // 同じ upright_since_valid_ を「静置検出 (Fallen→Idle)」に流用するが、これは
+  // Balancing への遷移保留ではないため state_==Idle の場合のみ true とする。
+  bool armPending() const {
+    return state_ == FsmState::Idle && upright_since_valid_;
+  }
+
   // INITIALIZING 完了 (自己検査含む) の報告。auto-arm ゲート (§6) を適用。
   void notifyInitDone() {
     if (state_ != FsmState::Initializing) return;

@@ -1,0 +1,993 @@
+"""Post-run analysis of a bsl-telemetry session (schema v1).
+
+Pure, deterministic functions that reconstruct loss/timing/event
+information purely from a session's raw.jsonl (plus metadata.json for
+identity/rejected-packet bookkeeping that the receiver alone can observe).
+Nothing here depends on wall-clock time or network state, so a session can
+be re-analyzed at any time and will always produce the same events.jsonl /
+summary.json for the same raw.jsonl + metadata.json inputs.
+
+See docs/plans/2026-07-05-udp-telemetry-phase1.md section 3.2 ("analyzer").
+
+CLI usage:
+    python3 tools/telemetry/bsl_telemetry/analyzer.py logs/telemetry/<session_id>
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+DT_H_LEN = 8
+
+# uint32 wrap-aware delta helpers (seq/loop/dt_h/ovr/stale/read_fail/trunc
+# are all firmware uint32 counters, see section 3.1).
+_UINT32_MOD = 1 << 32
+_UINT32_REBOOT_THRESHOLD = 1 << 31
+
+# Per-gap cap on how many individual missing seq numbers _classify_records()
+# tracks for possible later out-of-order recovery (2026-07-06 review 指摘1).
+# A forward gap wider than this still fully counts towards lost_estimate
+# immediately (see analyze_records()); only the first
+# _MAX_TRACKED_MISSING_PER_GAP of it remain individually recoverable if a
+# delayed datagram for one of those exact seq values later arrives -- this
+# bounds memory for a pathologically large gap (e.g. seconds of total
+# disconnection) without materially affecting normal-sized reordering.
+_MAX_TRACKED_MISSING_PER_GAP = 1000
+
+# Event types considered worth surfacing first, in priority order (used to
+# rank summary.json's recommended_windows).
+_WINDOW_PRIORITY = (
+    "reboot",
+    "reboot_lead_in",
+    "control_task_stall",
+    "fault_transition",
+    "loss",
+    "saturation",
+    "i2t",
+    "fsm_transition",
+    "device_change",
+    "firmware_change",
+)
+
+
+def _uint32_forward_delta(prev: int, curr: int) -> Optional[int]:
+    """Wrap-aware forward delta for a monotonic uint32 counter.
+
+    Returns the non-negative delta assuming forward progress (allowing for
+    at most one wraparound), or None if the observed jump looks like a
+    backward reset (device reboot) rather than legitimate wraparound.
+    """
+    delta = (curr - prev) % _UINT32_MOD
+    if delta >= _UINT32_REBOOT_THRESHOLD:
+        return None
+    return delta
+
+
+def _is_exact_duplicate(prev_packet: Optional[Dict[str, Any]], curr_packet: Dict[str, Any]) -> bool:
+    """True if `curr_packet` is a byte-for-byte retransmission of `prev_packet`.
+
+    UDP can deliver a duplicate datagram (e.g. a retry racing the original
+    arriving late); that is a harmless network-layer artifact, not a device
+    reboot, and must not be double-counted into variant/loss/dt stats either
+    (2026-07-05 review 指摘2a).
+    """
+    return prev_packet is not None and prev_packet == curr_packet
+
+
+def _detect_reboot(prev_packet: Optional[Dict[str, Any]], curr_packet: Dict[str, Any]) -> bool:
+    """Shared reboot predicate, called exactly once per record from
+    _classify_records() (in turn shared by analyze_records() and
+    assign_reboot_epochs()).
+
+    Both callers must agree on exactly where a reboot boundary falls
+    (analyze_records uses it to decide when to re-anchor its interval/delta
+    baselines; assign_reboot_epochs uses it to key events/raw excerpts by
+    epoch), otherwise event ordering (指摘2) and raw-excerpt keying (指摘3)
+    can silently disagree with the interval re-anchoring. Exposed as a
+    standalone function (rather than duplicated inline in both places) for
+    exactly that reason. Note that _classify_records() only calls this once
+    it has already ruled out the packet being a recovered out-of-order
+    (merely reordered/delayed) datagram -- see that function's docstring
+    (2026-07-06 review 指摘1) -- since a delayed datagram's seq/tick/t_us/
+    loop all legitimately look "backward" from the anchor's point of view,
+    which is exactly what this predicate is designed to flag as a reboot.
+
+    A firmware boot session is expected to make forward progress in `seq`,
+    `tick` and `t_us` from one packet to the next; a reboot resets all three
+    counters near zero. This predicate treats the current packet as unable
+    to represent forward progress from `prev_packet` (i.e. a reboot) unless
+    it is a harmless exact retransmission:
+
+      - `prev_packet` is None (first record ever seen): never a reboot.
+      - `curr_packet` is byte-identical to `prev_packet`: an exact UDP-level
+        duplicate datagram, NOT a reboot (2026-07-05 review 指摘2a). This
+        must be checked before the seq/tick/t_us rules below, since an
+        exact duplicate has "seq unchanged", which would otherwise match
+        the same-seq-differing-content rule.
+      - `seq` or `tick` regresses (uint32-wrap-aware, see
+        _uint32_forward_delta) relative to `prev_packet` -> reboot
+        (2026-07-05 review 指摘2b).
+      - `t_us` regresses -> reboot (指摘2b). Not uint32-wrap-checked: `t_us`
+        is `esp_timer_get_time()` microseconds since boot (int64), which
+        does not wrap over any realistic session length.
+      - `seq` is unchanged (forward delta 0) but the packet is not an exact
+        duplicate (i.e. some other field differs) -> reboot (2026-07-05
+        review 指摘2c). This covers a very-short-lived boot that crashes
+        again before its counters have advanced past the previous boot's
+        last successfully emitted `seq` value: reconnect-time jitter right
+        after startup can make the second boot's first successful send land
+        on the very same `seq` as the first boot's, without `t_us` or
+        `tick` necessarily having regressed on their own (e.g. the second
+        boot takes longer to reconnect, so its later-in-time `t_us` can
+        exceed the first boot's very early `t_us`) -- the old predicate
+        (seq-forward-delta-is-None OR t_us decreased) missed exactly this
+        case and silently analyzed the reset post-reboot counters against
+        the stale pre-reboot baseline.
+    """
+    if prev_packet is None:
+        return False
+    if _is_exact_duplicate(prev_packet, curr_packet):
+        return False
+
+    seq_delta = _uint32_forward_delta(prev_packet["seq"], curr_packet["seq"])
+    if seq_delta is None:
+        return True
+    if _uint32_forward_delta(prev_packet["tick"], curr_packet["tick"]) is None:
+        return True
+    if curr_packet["t_us"] < prev_packet["t_us"]:
+        return True
+    if seq_delta == 0:
+        return True  # same seq, content differs (duplicate already ruled out above)
+    # `loop` (ControlTask cycle counter) regression between two FULL packets
+    # -> reboot (2026-07-05 review round 6). Covers the case where the first
+    # post-reboot datagram(s) were lost so seq/tick appear to move forward,
+    # and reconnect-time jitter makes the post-reboot `t_us` exceed the short
+    # pre-reboot run's `t_us`. `loop` is monotonic within a boot (uint32 wrap
+    # at 200 Hz is ~248 days, far beyond any session), so a backward delta is
+    # a reboot signal. Diagnostic packets carry no `loop`, so this check only
+    # applies when both adjacent packets are the full variant.
+    if "loop" in prev_packet and "loop" in curr_packet:
+        if _uint32_forward_delta(prev_packet["loop"], curr_packet["loop"]) is None:
+            return True
+    return False
+
+
+def _in_boot_bounds(candidate: Dict[str, Any], lower: Dict[str, Any], upper: Dict[str, Any]) -> bool:
+    """True if `candidate` could plausibly be a same-boot datagram
+    transmitted between `lower` and `upper` (2026-07-06 review round 10
+    指摘1).
+
+    `lower`/`upper` are the two packets straddling the seq gap that made
+    `candidate`'s seq value "missing" in the first place: `lower` is the
+    last in-order packet accepted immediately before the gap, `upper` is
+    the first in-order packet accepted immediately after it (see
+    `missing`'s population in `_classify_records`). Firmware emits
+    telemetry packets with monotonically increasing `tick`/`t_us` (and, for
+    full-variant packets, `loop`) within a single boot, so a genuinely
+    delayed-but-not-lost datagram from that same boot must have been
+    transmitted somewhere in between: its `tick` and `t_us` must fall
+    within [lower, upper], inclusive of both ends (a delayed packet can
+    legitimately share a bound's exact value, e.g. back-to-back sends
+    within the same microsecond tick).
+
+    A post-reboot packet that happens to reuse the same (now-stale)
+    missing seq value instead carries freshly-reset `tick`/`t_us`/`loop`
+    values that -- for any boot that had already made non-trivial forward
+    progress before the gap -- fall well below `lower`'s, and fails this
+    check. That lets the caller fall through to the ordinary reboot
+    predicate instead of misclassifying the reboot as a recovered
+    reorder.
+
+    `loop` is only present on full-variant packets, so it is checked the
+    same way but only when `candidate`, `lower` and `upper` are all
+    full-variant; a diagnostic packet on either side of the comparison
+    skips the `loop` check.
+    """
+    if not (lower["t_us"] <= candidate["t_us"] <= upper["t_us"]):
+        return False
+    if not (lower["tick"] <= candidate["tick"] <= upper["tick"]):
+        return False
+    if "loop" in candidate and "loop" in lower and "loop" in upper:
+        if not (lower["loop"] <= candidate["loop"] <= upper["loop"]):
+            return False
+    return True
+
+
+def _classify_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Classify every record (aligned by position) as reboot / recovered
+    out-of-order / neither, and assign each one its reboot epoch.
+
+    Single shared entry point for both analyze_records() and
+    assign_reboot_epochs(): both need the exact same reboot-boundary and
+    out-of-order-recovery decisions (event ordering 指摘2, raw-excerpt
+    keying 指摘3, and now the out-of-order/reboot distinction 指摘1), so
+    both call this once instead of separately re-deriving it.
+
+    Ordinary UDP reordering can deliver a later `seq` before an earlier one
+    that was merely delayed (not lost) -- e.g. seq 43 arrives, then the
+    delayed seq 42 arrives after it. From the point of view of a naive
+    "does seq make forward progress from the last packet we saw" check,
+    that delayed seq 42 looks exactly like a reboot's counter reset: seq
+    goes backward relative to the anchor (2026-07-06 review 指摘1). Treating
+    every such reorder as a reboot re-anchors every interval/delta baseline
+    and fabricates a bogus reboot event plus a bogus loss window, even
+    though nothing was actually lost or restarted.
+
+    This is resolved with a per-epoch "missing seq" map: whenever a
+    legitimate forward gap is observed (delta > 1), every seq number the
+    gap skipped over is recorded into `missing` (capped at
+    _MAX_TRACKED_MISSING_PER_GAP per gap so a huge gap cannot exhaust
+    memory -- ordinary bookkeeping only, the excess is never individually
+    recoverable), mapped to a `(lower_bound, upper_bound)` pair: the last
+    in-order packet accepted immediately before the gap, and the packet
+    that revealed the gap immediately after it. If a later record's seq
+    fails the forward-progress check *and* is a member of `missing` *and*
+    its `tick`/`t_us`/`loop` fall within that seq's recorded
+    `[lower_bound, upper_bound]` (see _in_boot_bounds, 2026-07-06 review
+    round 10 指摘1), it is a delayed datagram from the same boot: recovered
+    as out-of-order (removed from `missing`), not a reboot. A recovered
+    record must not become the new anchor -- doing so would compute the
+    *next* record's delta against an out-of-order (too small) seq instead
+    of the last in-order one, corrupting every interval/region/loss
+    tracker that assumes receive order tracks seq order (see
+    analyze_records(), which additionally excludes out-of-order records
+    from all of those trackers).
+
+    The `[lower_bound, upper_bound]` check (round 10 指摘1) guards against a
+    *post-reboot* packet reusing a pre-reboot gap's seq value before the
+    reboot predicate below gets a chance to fire: e.g. receive order seq 1,
+    3 (seq 2 missing, gap bounds = packet 1 .. packet 3), then a reboot
+    whose first *accepted* post-reboot packet happens to be seq 2 again
+    (its own seq 1 having been lost). Without the bounds check, that
+    post-reboot seq 2 looks exactly like the still-outstanding pre-reboot
+    seq 2 and would be silently "recovered" -- the epoch would never
+    advance, no reboot event would fire, and every counter/loss figure
+    downstream would be computed against the wrong (pre-reboot) baseline.
+    A genuinely delayed datagram from the same boot must have been
+    transmitted while `tick`/`t_us`/`loop` were between the gap's two
+    straddling packets (firmware counters only move forward within a
+    boot), so it always passes; a post-reboot packet's freshly-reset
+    counters (for any boot that had already made non-trivial progress
+    before the gap) fall outside that range and correctly fall through to
+    the reboot predicate instead. When the bounds check fails, `missing`'s
+    entry for that seq is deliberately left in place rather than removed
+    directly -- it disappears the same way every other pre-reboot entry
+    does, via the reboot boundary's `missing.clear()` below.
+
+    The missing-map recovery check runs *before* the general _detect_reboot
+    predicate (a real reboot's own counters can never explain away a
+    pre-reboot gap). A genuine reboot clears `missing`: none of a
+    pre-reboot epoch's still-unexplained gaps can ever be "recovered" by a
+    post-reboot packet, and post-reboot seq numbers restart near zero,
+    where they could otherwise coincidentally collide with a stale
+    pre-reboot missing entry.
+
+    2026-07-06 review round 9 指摘1: a *duplicate* of a datagram that has
+    already been recovered as out-of-order (or already processed in
+    ordinary forward order) can itself arrive later, e.g. receive order
+    1, 3, 2, 2 -- the second "2" is a duplicate of the just-recovered
+    delayed "2". By the time it arrives, `missing` no longer contains that
+    seq (the first "2" already discarded it) and it is not byte-identical
+    to `anchor` (which has moved on to seq 3), so neither the anchor-
+    duplicate check above nor the missing-set recovery below can catch it;
+    falling through to _detect_reboot() would see seq/tick regress
+    relative to `anchor` and fabricate a bogus reboot. The same failure
+    mode hits an in-order-processed packet's delayed duplicate (e.g.
+    1, 2, 3, 2): once `anchor` is seq 3, a duplicate of seq 2 is neither an
+    anchor-duplicate nor in `missing` (it was never lost in the first
+    place). Both are resolved with a second, complementary per-epoch map:
+    `observed` remembers every seq's packet content for the lifetime of
+    the epoch (not just the immediately preceding one). A later record
+    whose seq is already in `observed`:
+      - with matching content -> a harmless duplicate: skip it (it must
+        not touch `missing`, must not become the new anchor, and -- per
+        analyze_records() -- must not pollute any statistic).
+      - with differing content -> the same "same seq, different content"
+        reboot signal as _detect_reboot()'s rule 2c above, generalised to
+        a non-adjacent record (a reboot can reuse a low seq value, e.g.
+        seq=1, that was already observed earlier this same epoch).
+    `observed` is cleared on every reboot boundary, exactly like `missing`
+    (a post-reboot seq restarting near zero must not be compared against a
+    stale pre-reboot entry). Memory: analysis is offline over one already-
+    complete session, and a uint32 seq wraparound would need >6 years of
+    continuous 20 Hz telemetry, so retaining every observed seq for an
+    epoch's lifetime is not a practical concern.
+
+    Returns one dict per record, in `records` order:
+      - "epoch": 0-based reboot epoch (see assign_reboot_epochs).
+      - "is_reboot": True iff this record is the first post-reboot record.
+      - "is_out_of_order": True iff this record was recovered as a delayed,
+        merely-reordered datagram (never True at the same time as
+        "is_reboot").
+      - "is_duplicate": True iff this record is a harmless repeat of a
+        datagram already accounted for (either byte-identical to `anchor`,
+        or byte-identical to an earlier-this-epoch record at the same seq)
+        and must be excluded from every downstream statistic (never True
+        at the same time as "is_reboot" or "is_out_of_order").
+    """
+    classifications: List[Dict[str, Any]] = []
+    epoch = 0
+    anchor: Optional[Dict[str, Any]] = None
+    missing: Dict[int, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+    observed: Dict[int, Dict[str, Any]] = {}
+
+    for record in records:
+        packet = record["packet"]
+
+        if anchor is not None and _is_exact_duplicate(anchor, packet):
+            classifications.append(
+                {"epoch": epoch, "is_reboot": False, "is_out_of_order": False, "is_duplicate": True}
+            )
+            continue
+
+        seq = packet["seq"]
+
+        if seq in observed:
+            if observed[seq] == packet:
+                classifications.append(
+                    {"epoch": epoch, "is_reboot": False, "is_out_of_order": False, "is_duplicate": True}
+                )
+                continue
+            epoch += 1
+            missing.clear()
+            observed.clear()
+            classifications.append(
+                {"epoch": epoch, "is_reboot": True, "is_out_of_order": False, "is_duplicate": False}
+            )
+            anchor = packet
+            observed[seq] = packet
+            continue
+
+        forward_delta = _uint32_forward_delta(anchor["seq"], seq) if anchor is not None else None
+
+        if forward_delta is None and anchor is not None and seq in missing:
+            lower_bound, upper_bound = missing[seq]
+            if _in_boot_bounds(packet, lower_bound, upper_bound):
+                del missing[seq]
+                classifications.append(
+                    {"epoch": epoch, "is_reboot": False, "is_out_of_order": True, "is_duplicate": False}
+                )
+                observed[seq] = packet
+                continue
+            # Out of bounds (2026-07-06 review round 10 指摘1): this is not
+            # the same-boot delayed datagram the gap anticipated -- its
+            # tick/t_us/loop have been reset by a reboot. Leave the stale
+            # `missing[seq]` entry as-is (it is cleared, along with the
+            # rest of `missing`, by the reboot boundary handling below) and
+            # fall through to the ordinary reboot predicate.
+
+        is_reboot = _detect_reboot(anchor, packet)
+        if is_reboot:
+            epoch += 1
+            missing.clear()
+            observed.clear()
+        elif anchor is not None and forward_delta is not None and forward_delta > 1:
+            gap_start = (anchor["seq"] + 1) % _UINT32_MOD
+            gap_bounds = (anchor, packet)
+            for i in range(min(forward_delta - 1, _MAX_TRACKED_MISSING_PER_GAP)):
+                missing[(gap_start + i) % _UINT32_MOD] = gap_bounds
+
+        classifications.append(
+            {"epoch": epoch, "is_reboot": is_reboot, "is_out_of_order": False, "is_duplicate": False}
+        )
+        anchor = packet
+        observed[seq] = packet
+
+    return classifications
+
+
+def _percentile(sorted_values: Sequence[float], pct: float) -> Optional[float]:
+    """Nearest-rank percentile. Returns None for an empty sequence."""
+    if not sorted_values:
+        return None
+    k = int(round((pct / 100.0) * (len(sorted_values) - 1)))
+    k = max(0, min(len(sorted_values) - 1, k))
+    return sorted_values[k]
+
+
+def load_raw_records(raw_path: Path) -> List[Dict[str, Any]]:
+    """Load raw.jsonl into a list of {host_receive_ns, source_ip, packet} dicts.
+
+    Malformed lines are skipped (they should not occur since receiver.py only
+    appends already-validated packets, but this keeps re-analysis robust
+    against a hand-edited or truncated raw.jsonl).
+    """
+    records: List[Dict[str, Any]] = []
+    if not raw_path.exists():
+        return records
+    with raw_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
+
+
+def load_metadata(session_dir: Path) -> Dict[str, Any]:
+    metadata_path = session_dir / "metadata.json"
+    if not metadata_path.exists():
+        return {}
+    with metadata_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _region_tracker_update(
+    state: Optional[Tuple[int, int]],
+    active: bool,
+    seq: int,
+    epoch: int,
+    event_type: str,
+    events: List[Dict[str, Any]],
+) -> Optional[Tuple[int, int]]:
+    """Track a contiguous run of `active == True` over ordered full packets.
+
+    `state` is (start_seq, last_true_seq) or None. Appends a closed-region
+    event to `events` the moment the run ends. Returns the updated state.
+    `epoch` tags the closed event with its reboot epoch (see
+    assign_reboot_epochs) so events sort correctly across a reboot boundary
+    even though `seq` restarts from 1 (指摘2/3).
+    """
+    if active:
+        if state is None:
+            return (seq, seq)
+        return (state[0], seq)
+    if state is not None:
+        events.append(
+            {
+                "type": event_type,
+                "severity": "warn",
+                "epoch": epoch,
+                "start_seq": state[0],
+                "end_seq": state[1],
+            }
+        )
+    return None
+
+
+def _close_open_regions(
+    events: List[Dict[str, Any]],
+    epoch: int,
+    sat_region: Optional[Tuple[int, int]],
+    i2t_region: Optional[Tuple[int, int]],
+    loop_stall_start: Optional[int],
+    prev_full: Optional[Dict[str, Any]],
+) -> None:
+    """Close any still-open saturation/i2t/control-task-stall region as an event.
+
+    Used both (a) when a reboot is detected mid-session -- so an episode
+    that was still in progress right before the reboot is reported instead
+    of silently discarded when the baselines are reset (指摘1: without
+    this, only the reboot event would show up and the pre-reboot
+    saturation/i2t/stall precursor would vanish) -- and (b) at the very end
+    of the session, for a region that is still open when records run out.
+    `epoch` should be the epoch the open region belongs to (the pre-reboot
+    epoch in case (a), the final epoch in case (b)).
+    """
+    if sat_region is not None:
+        events.append(
+            {"type": "saturation", "severity": "warn", "epoch": epoch, "start_seq": sat_region[0], "end_seq": sat_region[1]}
+        )
+    if i2t_region is not None:
+        events.append(
+            {"type": "i2t", "severity": "warn", "epoch": epoch, "start_seq": i2t_region[0], "end_seq": i2t_region[1]}
+        )
+    if loop_stall_start is not None and prev_full is not None:
+        events.append(
+            {
+                "type": "control_task_stall",
+                "severity": "error",
+                "epoch": epoch,
+                "start_seq": loop_stall_start,
+                "end_seq": prev_full["seq"],
+            }
+        )
+
+
+def assign_reboot_epochs(records: Sequence[Dict[str, Any]]) -> List[int]:
+    """Return the reboot epoch (0-based, incremented once per detected
+    reboot) for each record in `records`, aligned by position.
+
+    A "reboot" here is exactly the condition analyze_records() uses to
+    re-anchor its baselines -- see _detect_reboot() for the full predicate
+    (uint32-wrap-aware backward jump in `seq`/`tick`, a backward jump in
+    `t_us`, or an unchanged `seq` whose content differs from a harmless
+    exact duplicate). Firmware `seq` restarts at 1 after a reboot while the
+    receiver keeps appending to the same session, so `seq` alone is not a
+    safe ordering/keying key once a reboot has occurred (指摘2:
+    events.jsonl/report ordering, 指摘3: report.py raw excerpt keying).
+    Exposed as a standalone helper (rather than inlined only in
+    analyze_records) so report.py can independently derive the same epoch
+    for raw.jsonl records without analyzer.py and report.py ever
+    disagreeing on where a reboot boundary falls; sharing _detect_reboot()
+    with analyze_records() is what keeps the two in agreement (指摘2 review:
+    a second, subtly different reboot predicate copy-pasted here previously
+    missed the same-seq-differing-content case that analyze_records()'s
+    inline predicate also missed).
+
+    2026-07-06 review 指摘1: a record recovered as a merely reordered
+    (delayed-but-not-lost) out-of-order datagram is -- by construction --
+    never a reboot, so it keeps the current (not yet incremented) epoch; it
+    "belongs to" the epoch already in progress rather than starting a new
+    one. Delegates to _classify_records() (shared with analyze_records())
+    rather than re-deriving this decision independently, so the two can
+    never disagree about which records are reboots vs. recovered
+    reorderings vs. ordinary forward progress.
+    """
+    return [c["epoch"] for c in _classify_records(records)]
+
+
+def analyze_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Compute events + summary fields from a list of raw.jsonl records.
+
+    Pure function: no I/O, deterministic given `records`. Returns a dict
+    with an "events" key (list, unsorted-by-caller-safe: already sorted by
+    reboot epoch then seq/start_seq -- see assign_reboot_epochs -- so the
+    chronological order survives a firmware reboot restarting `seq` at 1,
+    指摘2) plus assorted summary fields that callers merge with session
+    metadata (device_id, firmware, rejected_packets, ...).
+    """
+    events: List[Dict[str, Any]] = []
+    loss_events: List[Dict[str, Any]] = []
+    classifications = _classify_records(records)
+    epoch = 0
+
+    variant_counts = {"full": 0, "diagnostic": 0}
+    diagnostic_by_reason = {"read_fail": 0, "trunc": 0}
+    tick_seq_gaps: List[int] = []
+    dt_us_samples: List[int] = []
+
+    prev_seq: Optional[int] = None
+    prev_t_us: Optional[int] = None
+    lost_estimate = 0
+    reboot_count = 0
+    out_of_order_count = 0
+    duplicate_count = 0
+
+    # Full-packet-only interval trackers (dt_h/ovr/stale/loop). Reset to
+    # None whenever a reboot is detected so deltas are never computed across
+    # a reboot boundary (re-anchoring, section 3.2).
+    prev_full: Optional[Dict[str, Any]] = None
+    dt_h_totals = [0] * DT_H_LEN
+    dt_h_intervals = 0
+    ovr_total_delta = 0
+    stale_total_delta = 0
+    loop_stall_start: Optional[int] = None
+
+    # read_fail/trunc are present on both variants, so their interval
+    # tracker spans every record (not just full packets).
+    prev_rf_tr: Optional[Tuple[int, int]] = None
+    read_fail_total_delta = 0
+    trunc_total_delta = 0
+
+    prev_fsm: Optional[int] = None
+    prev_fault: Optional[int] = None
+    sat_region: Optional[Tuple[int, int]] = None
+    i2t_region: Optional[Tuple[int, int]] = None
+
+    # dev/fw are present on every packet (both variants); a mid-session
+    # change indicates a different device or firmware build mixed into this
+    # session (misconfiguration / multi-device mixup, section 3.2 threat
+    # model), independent of the reboot re-anchoring above.
+    prev_dev: Optional[str] = None
+    prev_fw: Optional[str] = None
+
+    for record_idx, record in enumerate(records):
+        packet = record["packet"]
+        classification = classifications[record_idx]
+        epoch = classification["epoch"]
+
+        if classification["is_duplicate"]:
+            # Harmless duplicate datagram -- either byte-identical to the
+            # immediately preceding accepted record (指摘2a), or a delayed
+            # repeat of an already-recovered/-processed record at the same
+            # seq arriving later in receive order (2026-07-06 review round
+            # 9 指摘1; see _classify_records()'s `observed` map). Either way
+            # it must not be double-counted into variant/loss/dt stats, and
+            # must not look like a stalled control loop (a loop/dt_h delta
+            # of exactly zero) or a reboot. Leave every baseline untouched
+            # (there is nothing new to anchor on) and move on.
+            duplicate_count += 1
+            continue
+
+        variant = "full" if packet.get("snap_valid") else "diagnostic"
+
+        if classification["is_out_of_order"]:
+            # 2026-07-06 review 指摘1: a delayed datagram from the same boot,
+            # recovered via _classify_records()'s missing-seq set. It is a
+            # genuinely-received packet (counts towards the simple
+            # per-packet tallies below and towards out_of_order_count), but
+            # it must not participate in -- or become the new anchor for --
+            # any order-sensitive adjacent-record comparison (loss, dt_h/
+            # ovr/stale/loop interval trackers, saturation/i2t region
+            # tracking, loop-stall detection, fsm/fault transitions, dev/fw
+            # change detection, read_fail/trunc deltas): all of those assume
+            # receive order tracks seq order, which this record violates by
+            # construction. lost_estimate is corrected here (rather than
+            # left at the pessimistic estimate made when the gap it fills
+            # was first observed) so a recovered reorder does not inflate
+            # the final loss count -- a gap that is never explained by a
+            # later out-of-order arrival correctly remains counted (see
+            # test_out_of_order_... tests).
+            out_of_order_count += 1
+            lost_estimate -= 1
+            variant_counts[variant] += 1
+            tick_seq_gaps.append(packet["tick"] - packet["seq"])
+            if variant == "diagnostic":
+                reason = packet["reason"]
+                diagnostic_by_reason[reason] = diagnostic_by_reason.get(reason, 0) + 1
+            else:
+                dt_us_samples.append(packet["dt_us"])
+            continue
+
+        seq = packet["seq"]
+        tick = packet["tick"]
+        t_us = packet["t_us"]
+        dev = packet.get("dev")
+        fw = packet.get("fw")
+        variant_counts[variant] += 1
+        tick_seq_gaps.append(tick - seq)
+
+        is_reboot = classification["is_reboot"]
+
+        if not is_reboot and prev_seq is not None:
+            delta = _uint32_forward_delta(prev_seq, seq)
+            if delta is not None and delta > 1:
+                lost = delta - 1
+                lost_estimate += lost
+                loss_events.append(
+                    {
+                        "type": "loss",
+                        "severity": "warn",
+                        "epoch": epoch,
+                        "start_seq": prev_seq,
+                        "end_seq": seq,
+                        "lost_packets": lost,
+                    }
+                )
+
+        if is_reboot:
+            reboot_count += 1
+            # 指摘1: close any region that was still open right before the
+            # reboot -- tagged with the *pre-reboot* epoch, since it belongs
+            # to the segment that is about to be discarded below -- before
+            # the baselines are reset. Otherwise a saturation/i2t/stall
+            # episode in progress at the moment of the reboot silently
+            # vanishes and only the reboot itself gets reported.
+            _close_open_regions(
+                events, classifications[record_idx - 1]["epoch"], sat_region, i2t_region, loop_stall_start, prev_full
+            )
+            events.append(
+                {
+                    "type": "reboot",
+                    "severity": "error",
+                    "epoch": epoch,
+                    "seq": seq,
+                    "prev_seq": prev_seq,
+                    "t_us": t_us,
+                    "prev_t_us": prev_t_us,
+                }
+            )
+            # Re-anchor: forget every "previous" baseline so no delta is
+            # computed across the reboot boundary.
+            prev_full = None
+            prev_rf_tr = None
+            prev_fsm = None
+            prev_fault = None
+            sat_region = None
+            i2t_region = None
+            loop_stall_start = None
+
+        prev_seq = seq
+        prev_t_us = t_us
+
+        # dev/fw change detection happens after the reboot handling above so
+        # a change observed on the very first post-reboot packet is tagged
+        # with the new epoch (its `seq` belongs to the post-reboot
+        # numbering, 指摘2).
+        if prev_dev is not None and dev != prev_dev:
+            events.append(
+                {"type": "device_change", "severity": "error", "epoch": epoch, "seq": seq, "from": prev_dev, "to": dev}
+            )
+        if prev_fw is not None and fw != prev_fw:
+            events.append(
+                {"type": "firmware_change", "severity": "warn", "epoch": epoch, "seq": seq, "from": prev_fw, "to": fw}
+            )
+        prev_dev = dev
+        prev_fw = fw
+
+        read_fail = packet["read_fail"]
+        trunc = packet["trunc"]
+        if prev_rf_tr is not None:
+            rf_delta = _uint32_forward_delta(prev_rf_tr[0], read_fail)
+            tr_delta = _uint32_forward_delta(prev_rf_tr[1], trunc)
+            if rf_delta is not None:
+                read_fail_total_delta += rf_delta
+            if tr_delta is not None:
+                trunc_total_delta += tr_delta
+        prev_rf_tr = (read_fail, trunc)
+
+        if variant == "diagnostic":
+            reason = packet["reason"]
+            diagnostic_by_reason[reason] = diagnostic_by_reason.get(reason, 0) + 1
+            continue
+
+        dt_us_samples.append(packet["dt_us"])
+
+        fsm = packet["fsm"]
+        fault = packet["fault"]
+        if prev_fsm is not None and fsm != prev_fsm:
+            events.append(
+                {"type": "fsm_transition", "severity": "info", "epoch": epoch, "seq": seq, "from": prev_fsm, "to": fsm}
+            )
+        if prev_fault is not None and fault != prev_fault:
+            events.append(
+                {
+                    "type": "fault_transition",
+                    "severity": "warn" if fault else "info",
+                    "epoch": epoch,
+                    "seq": seq,
+                    "from": prev_fault,
+                    "to": fault,
+                }
+            )
+        prev_fsm = fsm
+        prev_fault = fault
+
+        sat_region = _region_tracker_update(sat_region, packet["sat"], seq, epoch, "saturation", events)
+        i2t_region = _region_tracker_update(i2t_region, packet["i2t"], seq, epoch, "i2t", events)
+
+        loop = packet["loop"]
+        dt_h = packet["dt_h"]
+        ovr = packet["ovr"]
+        stale = packet["stale"]
+
+        if prev_full is not None:
+            loop_delta = _uint32_forward_delta(prev_full["loop"], loop)
+            if loop_delta is not None:
+                dt_h_intervals += 1
+                for bin_idx in range(DT_H_LEN):
+                    bin_delta = _uint32_forward_delta(prev_full["dt_h"][bin_idx], dt_h[bin_idx])
+                    if bin_delta is not None:
+                        dt_h_totals[bin_idx] += bin_delta
+                ovr_delta = _uint32_forward_delta(prev_full["ovr"], ovr)
+                if ovr_delta is not None:
+                    ovr_total_delta += ovr_delta
+                stale_delta = _uint32_forward_delta(prev_full["stale"], stale)
+                if stale_delta is not None:
+                    stale_total_delta += stale_delta
+
+                if loop_delta == 0:
+                    if loop_stall_start is None:
+                        loop_stall_start = prev_full["seq"]
+                elif loop_stall_start is not None:
+                    events.append(
+                        {
+                            "type": "control_task_stall",
+                            "severity": "error",
+                            "epoch": epoch,
+                            "start_seq": loop_stall_start,
+                            "end_seq": prev_full["seq"],
+                        }
+                    )
+                    loop_stall_start = None
+
+        prev_full = {"seq": seq, "loop": loop, "dt_h": list(dt_h), "ovr": ovr, "stale": stale}
+
+    # Close out any regions still open at the end of the session.
+    _close_open_regions(events, epoch, sat_region, i2t_region, loop_stall_start, prev_full)
+
+    events.extend(loss_events)
+    events.sort(key=lambda e: (e.get("epoch", 0), e.get("start_seq", e.get("seq", 0))))
+
+    total_expected = variant_counts["full"] + variant_counts["diagnostic"] + lost_estimate
+    loss_rate = (lost_estimate / total_expected) if total_expected > 0 else 0.0
+
+    dt_us_sorted = sorted(dt_us_samples)
+    dt_us_stats = {
+        "count": len(dt_us_samples),
+        "mean": (sum(dt_us_samples) / len(dt_us_samples)) if dt_us_samples else None,
+        "min": dt_us_sorted[0] if dt_us_sorted else None,
+        "max": dt_us_sorted[-1] if dt_us_sorted else None,
+        "p50": _percentile(dt_us_sorted, 50),
+        "p95": _percentile(dt_us_sorted, 95),
+    }
+
+    dt_h_sum = sum(dt_h_totals)
+    dt_h_fractions = [(count / dt_h_sum) if dt_h_sum else 0.0 for count in dt_h_totals]
+
+    tick_seq_gap_stats = {
+        "max": max(tick_seq_gaps) if tick_seq_gaps else None,
+        "mean": (sum(tick_seq_gaps) / len(tick_seq_gaps)) if tick_seq_gaps else None,
+    }
+
+    return {
+        "events": events,
+        "packet_count": len(records),
+        "variant_counts": variant_counts,
+        "loss": {
+            "lost_estimate": lost_estimate,
+            "loss_rate": loss_rate,
+            "gap_count": len(loss_events),
+        },
+        "dt_us": dt_us_stats,
+        "dt_histogram": {
+            "totals": dt_h_totals,
+            "fractions": dt_h_fractions,
+            "intervals": dt_h_intervals,
+        },
+        "overrun_total_delta": ovr_total_delta,
+        "imu_stale_total_delta": stale_total_delta,
+        "read_fail_total_delta": read_fail_total_delta,
+        "trunc_total_delta": trunc_total_delta,
+        "diagnostic_by_reason": diagnostic_by_reason,
+        "tick_seq_gap": tick_seq_gap_stats,
+        "reboot_count": reboot_count,
+        "out_of_order_count": out_of_order_count,
+        "duplicate_count": duplicate_count,
+    }
+
+
+def build_recommended_windows(
+    events: Sequence[Dict[str, Any]], margin: int = 5, limit: int = 8
+) -> List[Dict[str, Any]]:
+    """Pick the seq windows an agent should read raw.jsonl for first.
+
+    Ranks by event-type priority (reboot/stall/fault first, then loss,
+    then saturation/i2t/fsm), widening each event's seq span by `margin` on
+    both sides so the raw excerpt includes some lead-in/lead-out context.
+    Each window carries the source event's `epoch` (指摘3 originally: report.py
+    needs it to excerpt raw.jsonl records from the correct reboot segment,
+    since `seq` alone can collide across a reboot boundary).
+
+    A `reboot` event is a special cross-epoch case (ゲート2レビュー(2回目)
+    指摘3): its own `seq`/`epoch` describe only the *post*-reboot side, so a
+    single window built the generic way never shows any pre-reboot context.
+    For reboot events this emits *two* windows -- the usual post-reboot one
+    plus a `reboot_lead_in` window anchored on `prev_seq` in the preceding
+    epoch -- so an agent reading recommended_windows always sees the cycles
+    immediately leading up to the reboot, not just the fresh restart at
+    seq 1. The lead-in half is only emitted when the event carries a real
+    (>=1) epoch; a hand-crafted reboot event with no "epoch" field has no
+    reliable pre-reboot epoch to anchor on and yields just the one window
+    (kept for backward compatibility with pre-existing callers/tests that
+    build reboot events without an epoch).
+    """
+    windows: List[Dict[str, Any]] = []
+    for event in events:
+        if event["type"] == "fault_transition" and not event.get("to"):
+            continue  # only flag transitions INTO a fault, not recovery to 0
+        if event["type"] == "reboot":
+            epoch = event.get("epoch", 0)
+            seq = event["seq"]
+            windows.append(
+                {
+                    "label": "reboot",
+                    "epoch": epoch,
+                    "start_seq": max(0, seq - margin),
+                    "end_seq": seq + margin,
+                    "severity": event.get("severity", "info"),
+                }
+            )
+            if epoch >= 1:
+                prev_seq = event["prev_seq"]
+                windows.append(
+                    {
+                        "label": "reboot_lead_in",
+                        "epoch": epoch - 1,
+                        "start_seq": max(0, prev_seq - margin),
+                        "end_seq": prev_seq + margin,
+                        "severity": event.get("severity", "info"),
+                    }
+                )
+            continue
+        if "start_seq" in event:
+            start, end = event["start_seq"], event["end_seq"]
+        elif "seq" in event:
+            start = end = event["seq"]
+        else:
+            continue  # pragma: no cover - defensive, all current event types have one of the above
+        windows.append(
+            {
+                "label": event["type"],
+                "epoch": event.get("epoch", 0),
+                "start_seq": max(0, start - margin),
+                "end_seq": end + margin,
+                "severity": event.get("severity", "info"),
+            }
+        )
+
+    def sort_key(window: Dict[str, Any]) -> Tuple[int, int]:
+        try:
+            priority = _WINDOW_PRIORITY.index(window["label"])
+        except ValueError:
+            priority = len(_WINDOW_PRIORITY)
+        return (priority, window["start_seq"])
+
+    windows.sort(key=sort_key)
+    return windows[:limit]
+
+
+def _default_rejected_packets() -> Dict[str, Any]:
+    return {"total": 0, "by_source": {}, "by_reason": {}}
+
+
+def analyze_session(session_dir: Path, write: bool = True) -> Dict[str, Any]:
+    """Analyze one session directory and (optionally) write events/summary.
+
+    Reads raw.jsonl (source of truth for events/timing) and metadata.json
+    (source of truth for identity + rejected_packets, which are not
+    reconstructible from raw.jsonl since rejected packets are never
+    appended there). Returns {"events": [...], "summary": {...}}.
+    """
+    session_dir = Path(session_dir)
+    records = load_raw_records(session_dir / "raw.jsonl")
+    metadata = load_metadata(session_dir)
+
+    result = analyze_records(records)
+    events = result.pop("events")
+    summary = result
+
+    summary["session_id"] = metadata.get("session_id", session_dir.name)
+    summary["device_id"] = metadata.get("device_id")
+    summary["firmware"] = metadata.get("firmware")
+    summary["started_at"] = metadata.get("started_at")
+    summary["ended_at"] = metadata.get("ended_at")
+
+    if records:
+        first_ns = records[0]["host_receive_ns"]
+        last_ns = records[-1]["host_receive_ns"]
+        summary["duration_s"] = max(0.0, (last_ns - first_ns) / 1e9)
+    else:
+        summary["duration_s"] = 0.0
+
+    summary["rejected_packets"] = metadata.get("rejected_packets", _default_rejected_packets())
+
+    event_counts: Dict[str, int] = {}
+    for event in events:
+        event_counts[event["type"]] = event_counts.get(event["type"], 0) + 1
+    summary["event_counts"] = event_counts
+    summary["recommended_windows"] = build_recommended_windows(events)
+
+    if write:
+        _write_jsonl(session_dir / "events.jsonl", events)
+        _write_json(session_dir / "summary.json", summary)
+
+    return {"events": events, "summary": summary}
+
+
+def _write_jsonl(path: Path, items: Sequence[Dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for item in items:
+            handle.write(json.dumps(item, sort_keys=True))
+            handle.write("\n")
+
+
+def _write_json(path: Path, obj: Dict[str, Any]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(obj, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Analyze a bsl-telemetry session directory")
+    parser.add_argument("session_dir", type=Path, help="logs/telemetry/<session_id> directory")
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    result = analyze_session(args.session_dir, write=True)
+    print(f"wrote {args.session_dir / 'events.jsonl'} ({len(result['events'])} events)")
+    print(f"wrote {args.session_dir / 'summary.json'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

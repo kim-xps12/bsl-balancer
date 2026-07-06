@@ -1,0 +1,71 @@
+[WG1] s=1 t=1000 boot v=1 fw=t2fixture dev=core2-t2
+[WG1] s=2 t=51000 tk fsm=1 arm=0 ep=0
+[WG1] s=3 t=51200 st fsm=1 arm=0 q=1 conn=0 cing=0 udpr=0 librp=0 ab=0 roff=0 latch=0 pwf=0 sf=0 evo=0
+[WG1] s=4 t=101200 tk fsm=1 arm=0 ep=0
+[WG1] s=5 t=101200 op=begin fsm=1 arm=0 q=0 udpr=0 res=- dur=300
+[WG1] s=6 t=101700 st fsm=1 arm=0 q=0 conn=0 cing=1 udpr=0 librp=0 ab=0 roff=0 latch=0 pwf=0 sf=0 evo=0
+[WG1] s=7 t=151700 tk fsm=2 arm=0 ep=0
+[WG1] s=8 t=151700 op=disc fsm=2 arm=0 q=1 udpr=0 res=1 dur=300
+[WG1] s=9 t=152200 st fsm=2 arm=0 q=1 conn=0 cing=1 udpr=0 librp=0 ab=1 roff=0 latch=0 pwf=0 sf=0 evo=0
+[WG1] s=10 t=202200 tk fsm=2 arm=0 ep=0
+[WG1] s=11 t=152200 ev=disc r=8 i=1
+[WG1] s=12 t=202400 st fsm=2 arm=0 q=1 conn=0 cing=0 udpr=0 librp=0 ab=0 roff=0 latch=0 pwf=0 sf=0 evo=0
+[WG1] s=13 t=252400 tk fsm=2 arm=0 ep=1
+[WG1] s=14 t=302600 tk fsm=2 arm=0 ep=1
+[WG1] s=15 t=352800 tk fsm=2 arm=0 ep=1
+[WG1] s=16 t=403000 tk fsm=2 arm=0 ep=1
+[WG1] s=17 t=453200 tk fsm=2 arm=0 ep=1
+[WG1] s=18 t=503400 tk fsm=2 arm=0 ep=1
+[WG1] s=19 t=553600 tk fsm=2 arm=0 ep=1
+[WG1] s=20 t=603800 tk fsm=2 arm=0 ep=1
+[WG1] s=21 t=654000 tk fsm=2 arm=0 ep=1
+[WG1] s=22 t=704200 tk fsm=2 arm=0 ep=1
+[WG1] s=23 t=754400 tk fsm=2 arm=0 ep=1
+[WG1] s=24 t=804600 tk fsm=2 arm=0 ep=1
+[WG1] s=25 t=854800 tk fsm=2 arm=0 ep=1
+[WG1] s=26 t=905000 tk fsm=2 arm=0 ep=1
+[WG1] s=27 t=955200 tk fsm=2 arm=0 ep=1
+[WG1] s=28 t=1005400 tk fsm=2 arm=0 ep=1
+[WG1] s=29 t=1005600 hb fsm=2 arm=0 q=1 conn=0 cing=0 udpr=0 librp=0 ab=0 roff=0 latch=0 pwf=0 sf=0 evo=0 heap=180000 heapmin=170000 evdrop=0 flmax=0 stkmin=4096 tick=20
+[WG1] s=30 t=1055600 tk fsm=2 arm=0 ep=1
+[WG1] s=31 t=1105800 tk fsm=2 arm=0 ep=1
+[WG1] s=32 t=1156000 tk fsm=2 arm=0 ep=1
+[WG1] s=33 t=1206200 tk fsm=2 arm=0 ep=1
+[WG1] s=34 t=1256400 tk fsm=2 arm=0 ep=1
+[WG1] s=35 t=1306600 tk fsm=2 arm=0 ep=1
+[WG1] s=36 t=1356800 tk fsm=2 arm=0 ep=1
+[WG1] s=37 t=1407000 tk fsm=2 arm=0 ep=1
+[WG1] s=38 t=1457200 tk fsm=2 arm=0 ep=1
+[WG1] s=39 t=1507400 tk fsm=2 arm=0 ep=1
+[WG1] s=40 t=1557600 tk fsm=2 arm=0 ep=1
+[WG1] s=41 t=1607800 tk fsm=2 arm=0 ep=1
+[WG1] s=42 t=1658000 tk fsm=2 arm=0 ep=1
+[WG1] s=43 t=1708200 tk fsm=2 arm=0 ep=1
+[WG1] s=44 t=1758400 tk fsm=2 arm=0 ep=1
+[WG1] s=45 t=1808600 tk fsm=2 arm=0 ep=1
+[WG1] s=46 t=1858800 tk fsm=2 arm=0 ep=1
+[WG1] s=47 t=1909000 tk fsm=2 arm=0 ep=1
+[WG1] s=48 t=1959200 tk fsm=2 arm=0 ep=1
+[WG1] s=49 t=2009400 tk fsm=2 arm=0 ep=1
+[WG1] s=50 t=2009600 hb fsm=2 arm=0 q=1 conn=0 cing=0 udpr=0 librp=0 ab=0 roff=0 latch=0 pwf=0 sf=0 evo=0 heap=180000 heapmin=170000 evdrop=0 flmax=0 stkmin=4096 tick=40
+[WG1] s=51 t=2059600 tk fsm=2 arm=0 ep=1
+[WG1] s=52 t=2109800 tk fsm=2 arm=0 ep=1
+[WG1] s=53 t=2160000 tk fsm=2 arm=0 ep=1
+[WG1] s=54 t=2210200 tk fsm=2 arm=0 ep=1
+[WG1] s=55 t=2260400 tk fsm=2 arm=0 ep=1
+[WG1] s=56 t=2310600 tk fsm=2 arm=0 ep=1
+[WG1] s=57 t=2360800 tk fsm=2 arm=0 ep=1
+[WG1] s=58 t=2411000 tk fsm=2 arm=0 ep=1
+[WG1] s=59 t=2461200 tk fsm=2 arm=0 ep=1
+[WG1] s=60 t=2511400 tk fsm=2 arm=0 ep=1
+[WG1] s=61 t=2561600 tk fsm=2 arm=0 ep=1
+[WG1] s=62 t=2611800 tk fsm=2 arm=0 ep=1
+[WG1] s=63 t=2662000 tk fsm=2 arm=0 ep=1
+[WG1] s=64 t=2712200 tk fsm=2 arm=0 ep=1
+[WG1] s=65 t=2762400 tk fsm=2 arm=0 ep=1
+[WG1] s=66 t=2812600 tk fsm=2 arm=0 ep=1
+[WG1] s=67 t=2862800 tk fsm=2 arm=0 ep=1
+[WG1] s=68 t=2913000 tk fsm=2 arm=0 ep=1
+[WG1] s=69 t=2963200 tk fsm=2 arm=0 ep=1
+[WG1] s=70 t=3013400 tk fsm=2 arm=0 ep=1
+[WG1] s=71 t=3013600 hb fsm=2 arm=0 q=1 conn=0 cing=0 udpr=0 librp=0 ab=0 roff=0 latch=0 pwf=0 sf=0 evo=0 heap=180000 heapmin=170000 evdrop=0 flmax=0 stkmin=4096 tick=60

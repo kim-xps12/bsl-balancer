@@ -16,6 +16,7 @@
 #include "hw/param_store.h"
 #include "shared/shared_state.h"
 #include "tasks/control_task.h"
+#include "tasks/telemetry_task.h"
 #include "tasks/ui_task.h"
 
 using namespace m5avatar;
@@ -90,6 +91,9 @@ void setup() {
                           &control_ctx, 20, nullptr, 0);
   xTaskCreatePinnedToCore(tasks::uiTaskEntry, "UiTask", 8192, &ui_ctx, 3,
                           nullptr, 1);
+  // UDP telemetry (計画書 §3.1): secrets 不在時は内部で no-op になるため、
+  // 呼び出し側 (ここ) に #ifdef は置かない。
+  tasks::startTelemetryTask(shared_state);
 }
 
 void loop() {
