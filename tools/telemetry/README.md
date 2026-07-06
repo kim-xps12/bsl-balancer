@@ -102,6 +102,19 @@ simulator → receiver → analyzer → report を通し、session dir 生成・
 「first packet が diagnostic でも session 開始」・IP pinning 拒否集計・
 reboot 再アンカーを検証する。
 
+## trace_check（Wi-Fi ガード計装ログの機械判定）
+
+`bsl_telemetry/trace_check.py` は
+[`docs/plans/2026-07-06-wifi-guard-trace-bench.md`](../../docs/plans/2026-07-06-wifi-guard-trace-bench.md)
+（§4 D3 grammar v1 / §5 判定規則）で定義された `[WG1]` 計装ログを判定する、
+上記の UDP テレメトリツールとは別系統の stdlib のみのチェッカである。
+`python3 tools/telemetry/bsl_telemetry/trace_check.py --scenario t1|t2|t3|t3b|t5 <log>`
+で実行し（R4・共通妥当性は全シナリオで常時実行）、規則ごとに
+PASS/FAIL/INVALID/WARN と根拠行を出力、終了コード 0 = 全 PASS（WARN は
+ブロックしない）。合成ログによるテストは `tests/test_trace_check.py`、
+実機ビルド由来の生成ログとの相互検証は `tests/fixtures/` の
+`<scenario>__<EXPECTED>__<desc>.log` を参照。
+
 ## 直接実行 / `-m` 実行の両対応について
 
 各スクリプトは以下のどちらでも動く:

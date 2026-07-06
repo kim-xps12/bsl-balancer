@@ -89,7 +89,14 @@ constexpr float kFallThresholdRad    = 0.611f;  // 35°
 constexpr float kStartWindowRad      = 0.0873f; // 5°
 constexpr float kStartRateMaxRadS    = 0.35f;   // ~20°/s
 constexpr float kStartWheelMaxRadS   = 1.0f;
-constexpr float kUprightHoldS        = 1.0f;    // 起立/静置検出の保持時間
+// #ifndef ガード化 (wifi-guard-trace 計画書 §6 T5): trace ビルドのみ
+// platformio.ini から -DBSL_UPRIGHT_HOLD_S=5.0f を注入し、arm_pending
+// ホールド窓を延長する (AP 電源断のビーコン喪失タイムアウト到達をベンチで
+// 決定的に観測するため)。リリース値・型・意味は不変 (未定義時は従来の 1.0f)。
+#ifndef BSL_UPRIGHT_HOLD_S
+#define BSL_UPRIGHT_HOLD_S 1.0f
+#endif
+constexpr float kUprightHoldS        = BSL_UPRIGHT_HOLD_S;  // 起立/静置検出の保持時間
 constexpr int   kFallEscalationCount = 3;       // 30s 内 3 回で FAULT ラッチ
 constexpr float kFallEscalationWindowS = 30.0f;
 constexpr bool  kAutoArmOnBootDefault  = true;  // コミッショニング後のみ有効 (Q5)
