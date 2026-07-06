@@ -1788,6 +1788,38 @@ static void test_trace_emitter_boot_line_format() {
   assertGrammarSequenceAndLength(log);
 }
 
+// ---- 行整形オーバーフロー防御 (ゲート2レビュー指摘 P2 対応) ----
+// snprintf は整形先スクラッチバッファに収まりきらない場合、「実際に格納
+// できた長さ」ではなく「省略なしなら本来必要だった長さ」を返す (C99/C++11
+// snprintf 契約)。旧実装の appendLine はこの (バッファより大きい) 長さを
+// そのまま memcpy(dst, line, n) に渡していたため、line (スクラッチバッファ)
+// の境界を超えて読み出し (スタック過読)、かつ切り詰められた grammar 不整合な
+// 行が trace 出力に混入し得た。fw を意図的に kMaxLineBoot を超える長さにして
+// この経路を踏ませ、(a) 溢れた行がバッファに書き込まれない、(b) evdrop に
+// 計上される、(c) 捨てられた行が s を消費しないため後続の正常行が壊れず
+// 正しい s から始まる、ことを検証する。
+// なお assertGrammarSequenceAndLength 内の「レコード種別ごとの最大行長」
+// assert は正常系の入力に対する予算保証 (計画書 D3 のバースト計算) であり、
+// 本テストはその予算を破る**異常系入力**に対する防御層 (本指摘の修正) を
+// 検証するものであり、両者は別の契約を守っている。
+static void test_trace_emitter_overlong_fw_drops_line_without_stack_overread() {
+  core::trace::TraceEmitter emitter;
+  // kMaxLineBoot (96B) を確実に超える fw 文字列 (200 文字)。
+  const std::string long_fw(200, 'A');
+  emitter.emitBoot(12345, long_fw.c_str(), "core2-abcd");
+
+  // (a) 溢れた boot 行はバッファへ一切書き込まれない。
+  TEST_ASSERT_EQUAL_UINT32(0u, static_cast<uint32_t>(emitter.bufferedBytes()));
+  // (b) evdrop に 1 件計上される (黙って欠落させない。計画書 D3)。
+  TEST_ASSERT_EQUAL_UINT32(1u, emitter.evdropTotal());
+
+  // (c) 捨てられた行は s (seq_) を消費していないため、後続の正常行 (tk) は
+  // s=1 から壊れずに出力される (連続性が保たれる)。
+  emitter.beginTick(99999, true, 2, false, 7);
+  const std::string log2(emitter.bufferData(), emitter.bufferedBytes());
+  TEST_ASSERT_EQUAL_STRING("[WG1] s=1 t=99999 tk fsm=2 arm=0 ep=7\n", log2.c_str());
+}
+
 // tick 内シーケンシング (D11): tk → ev → op(=bp, resample 付き) → st の順で
 // 1 tick 分の行が出力されること、grammar v1 の各フィールドが規定どおりで
 // あることを検証する (ゲート1第14回指摘2: op=bp の fsm2/arm2/fsm3/arm3 必須)。
@@ -2168,6 +2200,7 @@ int main(int, char**) {
   // wifi-guard-trace 計画書: additive アクセサ + trace_emitter (D3/D10/D11)
   RUN_TEST(test_wifi_guard_last_wifi_quiet_and_drained_epoch_accessors);
   RUN_TEST(test_trace_emitter_boot_line_format);
+  RUN_TEST(test_trace_emitter_overlong_fw_drops_line_without_stack_overread);
   RUN_TEST(test_trace_emitter_tick_order_and_bp_resample_fields);
   RUN_TEST(test_trace_emitter_ev_extra_subscriptions_have_no_i);
   RUN_TEST(test_trace_emitter_heartbeat_every_20_ticks);

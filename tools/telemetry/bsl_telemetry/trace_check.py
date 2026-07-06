@@ -598,13 +598,28 @@ def _find_disc_reconnect_triggers(
     return hits, failures
 
 
-def _evaluate_r1(sorted_records: Sequence[Record]) -> Outcome:
-    """R1 (T1, C1): op+ev stream quiet during every clean-entry Balancing window."""
+def _evaluate_r1(sorted_records: Sequence[Record], context_timeline: Sequence[Dict[str, Optional[int]]]) -> Outcome:
+    """R1 (T1, C1): op+ev stream quiet during every clean-entry Balancing window.
+
+    The window is anchored on `tk` rows, not the post-tick `st`/`hb` diff:
+    `tk.fsm` is the snapshot context guard actually processed *for that
+    tick* (section 5 "tick アンカーと証拠順序"), so guard already treats
+    itself as Balancing from the tick whose `tk` first shows fsm=2 --
+    anything recorded between that `tk` and the following post-tick `st`
+    (an ev drained or op issued earlier in that same tick's own processing)
+    must be inspected too. Anchoring on the post-tick `st fsm=2` instead
+    blinds R1 to library activity/op rows recorded inside the transition
+    tick itself (gate 2 review, P2: false PASS). The window closes
+    symmetrically at the next `tk` showing fsm!=2 (exclusive of that tick's
+    own position) -- since that boundary sits strictly after the *last*
+    Balancing tick's own trailing op/ev/st/hb records, everything recorded
+    during that last Balancing tick is still included.
+    """
     windows: List[Tuple[int, int]] = []
     in_window = False
     start_pos = 0
     for pos, r in enumerate(sorted_records):
-        if r.kind not in ("st", "hb"):
+        if r.kind != "tk":
             continue
         fsm = r.f.get("fsm")
         if not in_window and fsm == 2:
@@ -618,8 +633,14 @@ def _evaluate_r1(sorted_records: Sequence[Record]) -> Outcome:
 
     eligible = []
     for start, end in windows:
-        f = sorted_records[start].f
-        if f.get("cing") == 0 and f.get("librp") == 0 and f.get("ab") == 0:
+        # Precondition is evaluated on the last st/hb strictly before the
+        # entry tk (section 5 unchanged from before: "窓開始時点で cing=0∧
+        # librp=0∧ab=0"). context_timeline carries the most recent st/hb-
+        # derived context forward across non-st/hb positions, so at a `tk`
+        # position it is exactly "the last st/hb immediately preceding this
+        # tk" -- tk rows themselves carry no cing/librp/ab fields.
+        ctx = context_timeline[start]
+        if ctx.get("cing") == 0 and ctx.get("librp") == 0 and ctx.get("ab") == 0:
             eligible.append((start, end))
 
     if not eligible:
@@ -913,7 +934,7 @@ class CheckResult:
 
 
 _RULE_EVALUATORS = {
-    "R1": lambda sr, tk, tkt, ctx: _evaluate_r1(sr),
+    "R1": lambda sr, tk, tkt, ctx: _evaluate_r1(sr, ctx),
     "R2": lambda sr, tk, tkt, ctx: _evaluate_r2(sr, tk, tkt, ctx),
     "R3": lambda sr, tk, tkt, ctx: _evaluate_r3(sr, tk, tkt, ctx),
     "R3b": lambda sr, tk, tkt, ctx: _evaluate_r3b(sr, tk, tkt, ctx),

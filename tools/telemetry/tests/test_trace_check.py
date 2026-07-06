@@ -427,6 +427,47 @@ class TestR1(unittest.TestCase):
         self.assertTrue(result.ok, result.render())
         self.assertEqual(get_outcome(result, "R1").status, "PASS")
 
+    def test_fail_library_activity_in_transition_tick(self):
+        """遷移 tick 内（tk fsm=2 の後・st fsm=2 の前）に ev=scan が記録された
+        場合 -> R1 FAIL（窓を post-tick st で開くと見逃す偽 PASS の回帰防止）."""
+        log = Log()
+        log.boot()
+        sim = GuardSim(log)
+        sim.tick(fsm=1, arm=0)
+        log.st(fsm=1, arm=0, q=0, conn=1, cing=0, udpr=1, librp=0, ab=0, roff=0, latch=0)
+        sim.tick_start(fsm=2, arm=0)  # tk fsm=2 printed -- guard already treats this tick as Balancing
+        sim.library_event("scan")  # recorded before the post-tick st -- must still be caught
+        sim.drain_pending()
+        log.st(fsm=2, arm=0, q=1, conn=1, cing=0, udpr=1, librp=0, ab=0, roff=0, latch=0)
+        sim.tick(fsm=1, arm=0)
+        log.st(fsm=1, arm=0, q=0, conn=1, cing=0, udpr=1, librp=0, ab=0, roff=0, latch=0)
+        finish(log, sim, fsm=1, arm=0, q=0)
+
+        result = tc.check_log(log.text(), "t1")
+        self.assertFalse(result.ok)
+        outcome = get_outcome(result, "R1")
+        self.assertEqual(outcome.status, "FAIL")
+        self.assertIn("ev=scan", outcome.evidence[0])
+
+    def test_pass_no_activity_in_transition_tick_regression(self):
+        """同位置（tk fsm=2 の後・st fsm=2 の前）に op も ev もない場合 ->
+        PASS（回帰: tk アンカー化そのものが偽 FAIL を作らないことの確認）."""
+        log = Log()
+        log.boot()
+        sim = GuardSim(log)
+        sim.tick(fsm=1, arm=0)
+        log.st(fsm=1, arm=0, q=0, conn=1, cing=0, udpr=1, librp=0, ab=0, roff=0, latch=0)
+        sim.tick_start(fsm=2, arm=0)
+        sim.drain_pending()
+        log.st(fsm=2, arm=0, q=1, conn=1, cing=0, udpr=1, librp=0, ab=0, roff=0, latch=0)
+        sim.tick(fsm=1, arm=0)
+        log.st(fsm=1, arm=0, q=0, conn=1, cing=0, udpr=1, librp=0, ab=0, roff=0, latch=0)
+        finish(log, sim, fsm=1, arm=0, q=0)
+
+        result = tc.check_log(log.text(), "t1")
+        self.assertTrue(result.ok, result.render())
+        self.assertEqual(get_outcome(result, "R1").status, "PASS")
+
     def test_fail_forbidden_op_inside_window(self):
         log = Log()
         log.boot()

@@ -220,7 +220,7 @@ class TraceEmitter {
                                 "[WG1] s=%u t=%llu boot v=1 fw=%s dev=%s\n",
                                 static_cast<unsigned>(nextSeq()),
                                 static_cast<unsigned long long>(t_us), fw, dev);
-    appendLine(line, n);
+    appendLine(line, n, sizeof(line));
   }
 
   // tick 冒頭 (guard.tick() 呼び出し前): tk 行を出力し、この tick の snapshot
@@ -245,7 +245,7 @@ class TraceEmitter {
                                 static_cast<unsigned>(nextSeq()),
                                 static_cast<unsigned long long>(t_us), fsm_tok,
                                 arm_tok, static_cast<unsigned>(ep));
-    appendLine(line, n);
+    appendLine(line, n, sizeof(line));
   }
 
   // trace 専用リングを空になるまで drain し ev 行化する (tk の直後、
@@ -271,7 +271,7 @@ class TraceEmitter {
                                   static_cast<unsigned>(nextSeq()),
                                   static_cast<unsigned long long>(ev.t_us),
                                   evTag(ev.kind), r_tok, i_tok);
-      appendLine(line, n);
+      appendLine(line, n, sizeof(line));
     }
     const uint32_t dropped = ring.takeDropCount();
     if (dropped) evdrop_total_ += dropped;
@@ -309,7 +309,7 @@ class TraceEmitter {
           opTag(kind), fsm_tok, arm_tok, q ? 1 : 0, udpr ? 1 : 0, res_tok,
           static_cast<unsigned long long>(dur_us));
     }
-    appendLine(line, n);
+    appendLine(line, n, sizeof(line));
   }
 
   // tick 末尾: 状態タプルが前回から変化していれば st 行を出す。
@@ -340,7 +340,7 @@ class TraceEmitter {
                                 static_cast<unsigned>(nextSeq()),
                                 static_cast<unsigned long long>(t_us),
                                 static_cast<unsigned>(evdrop_total_));
-    appendDropReserved(line, n);
+    appendDropReserved(line, n, sizeof(line));
   }
 
   // フラッシュ (Serial.write 等) の前後で計測した所要時間を記録する
@@ -376,7 +376,7 @@ class TraceEmitter {
         s.udpr ? 1 : 0, s.librp ? 1 : 0, s.ab ? 1 : 0, s.roff ? 1 : 0,
         s.latch ? 1 : 0, static_cast<unsigned>(s.pwf), static_cast<unsigned>(s.sf),
         static_cast<unsigned>(s.evo));
-    appendLine(line, n);
+    appendLine(line, n, sizeof(line));
   }
 
   void emitHeartbeatLine(uint64_t t_us, const StateTuple& s, uint32_t heap,
@@ -397,7 +397,7 @@ class TraceEmitter {
         static_cast<unsigned>(heapmin), static_cast<unsigned>(evdrop_total_),
         static_cast<unsigned long long>(flush_max_us_since_hb_),
         static_cast<unsigned>(stkmin), static_cast<unsigned>(tick_number));
-    appendLine(line, n);
+    appendLine(line, n, sizeof(line));
     flush_max_us_since_hb_ = 0;  // 次の hb 区間用にリセット (計画書 D3)
   }
 
@@ -405,9 +405,20 @@ class TraceEmitter {
   // 実際に書き込めた行だけ s (seq_) を進める (欠番を作らない。ゲート1第16回
   // 指摘1・第15回指摘1対応: s の連続性を構造的に保証する)。収まらない場合は
   // 行を破棄し evdrop に計上する (黙って欠落させない。計画書 D3)。
-  void appendLine(const char* line, int n) {
-    if (n <= 0) {
-      ++evdrop_total_;  // snprintf 符号化異常 (理論上到達しない防御的分岐)
+  //
+  // scratch_capacity = 呼び出し側の整形用スクラッチバッファ (line) の実サイズ
+  // (= sizeof(line))。snprintf は出力が収まりきらない場合、「実際に格納できた
+  // 長さ」ではなく「省略なしなら本来必要だった長さ」を返す (C99/C++11 の
+  // snprintf 契約)。そのため fw/dev 等の可変長文字列 (emitBoot) がスクラッチ
+  // バッファを超えると n がその長さより大きくなり得る。旧実装はこの n を
+  // そのまま memcpy(dst, line, n) に渡していたため、line (スクラッチバッファ)
+  // の境界を超えて読み出す (スタック過読) 上に、切り詰められた grammar 不整合
+  // な行が trace 出力に混入し得た (ゲート2レビュー指摘対応)。n が
+  // scratch_capacity 以上 (= 切り詰め発生) の場合はその行を一切出力せず
+  // evdrop に計上し、drop マーカー経由で自己申告する。
+  void appendLine(const char* line, int n, size_t scratch_capacity) {
+    if (n < 0 || static_cast<size_t>(n) >= scratch_capacity) {
+      ++evdrop_total_;  // 符号化異常、または切り詰め (整形失敗として扱う)
       return;
     }
     const size_t len = static_cast<size_t>(n);
@@ -422,9 +433,12 @@ class TraceEmitter {
 
   // drop マーカー専用の予約枠 (kDropReserveBytes) への書き込み。予約枠のため
   // 通常行と競合せず、kMaxLineDrop <= kDropReserveBytes (static_assert 済み) に
-  // より理論上必ず収まる。
-  void appendDropReserved(const char* line, int n) {
-    if (n <= 0) return;
+  // より理論上必ず収まる。drop 行のフィールドはすべて固定範囲の数値のため
+  // 実運用では切り詰めは起こらないが、appendLine と同じ理由 (snprintf 契約) で
+  // scratch_capacity 超過時は memcpy せず捨てる (スタック過読の防止。
+  // ゲート2レビュー指摘と同一パターンの防御を一貫して適用する)。
+  void appendDropReserved(const char* line, int n, size_t scratch_capacity) {
+    if (n < 0 || static_cast<size_t>(n) >= scratch_capacity) return;
     const size_t len = static_cast<size_t>(n);
     if (used_ + len > kLineBufferBytes) return;  // 理論上到達しない防御的分岐
     std::memcpy(data_ + used_, line, len);
