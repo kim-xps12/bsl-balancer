@@ -16,6 +16,11 @@
 #ifndef BSL_FW_GIT
 #define BSL_FW_GIT "unknown"  // platformio.ini extra_scripts が通常は注入する (§3.1)
 #endif
+// Wi-Fi ガード計装 (trace) ビルドフラグ (wifi-guard-trace 計画書 §2 設計原則1)。
+// 未定義 (通常の m5stack-core2 env) では常に 0 = 本 PR 適用前とコード的に不変。
+#ifndef BSL_WIFI_GUARD_TRACE
+#define BSL_WIFI_GUARD_TRACE 0
+#endif
 
 #if BSL_TELEMETRY_SECRETS_AVAILABLE
 
@@ -30,6 +35,13 @@
 #include "../core/telemetry_format.h"
 #include "../core/wifi_guard.h"
 
+#if BSL_WIFI_GUARD_TRACE
+// Wi-Fi ガード計装 (trace) ビルド専用 (wifi-guard-trace 計画書 §3/D1)。
+// BSL_TELEMETRY_SECRETS_AVAILABLE 有効領域の**内側**にのみ現れるため、
+// trace ∧ ¬secrets ≡ ¬secrets (no-op) が構造的に保証される (D1/D6)。
+#include "../core/trace_emitter.h"
+#endif
+
 #endif  // BSL_TELEMETRY_SECRETS_AVAILABLE
 
 namespace tasks {
@@ -43,6 +55,20 @@ IPAddress g_host_ip;
 core::WifiGuard* g_guard = nullptr;
 shared::SharedState* g_shared = nullptr;
 char g_dev_id[16] = "core2-????";
+
+#if BSL_WIFI_GUARD_TRACE
+// ---- Wi-Fi ガード計装 (trace) 状態 (wifi-guard-trace 計画書 §4 D1) ----
+// telemetry task 単一スレッドで読み書き (trace リングのみ SPSC)。すべて
+// static 領域 (グローバル/名前空間スコープの静的ストレージ) に確保するため、
+// TraceEmitter 内蔵の 4096+64B 行バッファがタスクスタック (8192B) を圧迫
+// することはない (計画書 D3 スタック予算)。
+core::trace::TraceEmitter g_trace_emitter;
+core::trace::TraceEventRing g_trace_ring;
+// guard 対象イベント (gotip/disc/stop) にのみ振る到着通し番号 (計画書 D3 ev.i)。
+// コールバックは guard pushEvent → trace ring の順に単一タスク文脈 (Wi-Fi
+// イベントタスク) で push するため、この番号は guard キュー内の順序と一致する。
+uint32_t g_trace_guard_event_seq = 0;
+#endif
 
 // ---- WifiOps 実装: 実際の WiFi/WiFiUDP API 呼び出し (計画書 §3.1) ----
 void OpsBegin(void*) {
@@ -63,6 +89,59 @@ int OpsWritePacket(void*, const uint8_t* buf, size_t len) {
 }
 int OpsEndPacket(void*) { return g_udp.endPacket(); }
 
+#if BSL_WIFI_GUARD_TRACE
+// ---- Trace 版 WifiOps ラッパ (計画書 D4): 実 Ops への委譲 + 行バッファへの
+// 記録のみ。呼び出し順序・回数・引数は実 Ops (OpsBegin 等) に対して完全に不変。
+// Serial は一切呼ばない (D3 印字タイミング: フラッシュは tick 末尾 1 箇所のみ)。
+void TraceOpsBegin(void* ctx) {
+  const uint64_t t0 = static_cast<uint64_t>(esp_timer_get_time());
+  OpsBegin(ctx);
+  const uint64_t dur = static_cast<uint64_t>(esp_timer_get_time()) - t0;
+  g_trace_emitter.recordOp(core::trace::OpKind::Begin, t0, dur, /*res_valid=*/false,
+                           0, g_guard->lastWifiQuiet(), g_guard->udpReady());
+}
+bool TraceOpsDisconnect(void* ctx) {
+  const uint64_t t0 = static_cast<uint64_t>(esp_timer_get_time());
+  const bool res = OpsDisconnect(ctx);
+  const uint64_t dur = static_cast<uint64_t>(esp_timer_get_time()) - t0;
+  g_trace_emitter.recordOp(core::trace::OpKind::Disc, t0, dur, /*res_valid=*/true,
+                           res ? 1 : 0, g_guard->lastWifiQuiet(), g_guard->udpReady());
+  return res;
+}
+void TraceOpsSetRadioOff(void* ctx) {
+  const uint64_t t0 = static_cast<uint64_t>(esp_timer_get_time());
+  OpsSetRadioOff(ctx);
+  const uint64_t dur = static_cast<uint64_t>(esp_timer_get_time()) - t0;
+  g_trace_emitter.recordOp(core::trace::OpKind::RadioOff, t0, dur,
+                           /*res_valid=*/false, 0, g_guard->lastWifiQuiet(),
+                           g_guard->udpReady());
+}
+int TraceOpsBeginPacket(void* ctx) {
+  // op=bp: beginPacket 実行の直前/戻り直後で SharedState を即時再サンプルする
+  // (計画書 D3 R4 sampled 契約: 観測のみでガード判断には一切不使用。malloc/
+  // socket 確保は dur 区間内で起きるため pre のみでは確保区間を挟めない)。
+  core::trace::OpResample resample;
+  shared::Snapshot pre;
+  resample.read_ok2 = g_shared->read(&pre);
+  if (resample.read_ok2) {
+    resample.fsm2 = pre.fsm_state;
+    resample.arm2 = pre.arm_pending;
+  }
+  const uint64_t t0 = static_cast<uint64_t>(esp_timer_get_time());
+  const int res = OpsBeginPacket(ctx);
+  const uint64_t dur = static_cast<uint64_t>(esp_timer_get_time()) - t0;
+  shared::Snapshot post;
+  resample.read_ok3 = g_shared->read(&post);
+  if (resample.read_ok3) {
+    resample.fsm3 = post.fsm_state;
+    resample.arm3 = post.arm_pending;
+  }
+  g_trace_emitter.recordOp(core::trace::OpKind::Bp, t0, dur, /*res_valid=*/true, res,
+                           g_guard->lastWifiQuiet(), g_guard->udpReady(), resample);
+  return res;
+}
+#endif  // BSL_WIFI_GUARD_TRACE
+
 // Wi-Fi イベントコールバック: atomic なイベントキューへの push のみ (計画書 §3.1。
 // Wi-Fi API はここでは一切呼ばない)。
 void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
@@ -70,18 +149,100 @@ void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
       g_guard->pushEvent(core::WifiGuard::EventKind::GotIp);
+#if BSL_WIFI_GUARD_TRACE
+      g_trace_ring.push({static_cast<uint64_t>(esp_timer_get_time()),
+                         core::trace::EvKind::GotIp, 0,
+                         static_cast<int32_t>(++g_trace_guard_event_seq)});
+#endif
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       g_guard->pushEvent(core::WifiGuard::EventKind::StaDisconnected,
                          info.wifi_sta_disconnected.reason);
+#if BSL_WIFI_GUARD_TRACE
+      g_trace_ring.push({static_cast<uint64_t>(esp_timer_get_time()),
+                         core::trace::EvKind::Disc,
+                         info.wifi_sta_disconnected.reason,
+                         static_cast<int32_t>(++g_trace_guard_event_seq)});
+#endif
       break;
     case ARDUINO_EVENT_WIFI_STA_STOP:
       g_guard->pushEvent(core::WifiGuard::EventKind::StaStop);
+#if BSL_WIFI_GUARD_TRACE
+      g_trace_ring.push({static_cast<uint64_t>(esp_timer_get_time()),
+                         core::trace::EvKind::Stop, 0,
+                         static_cast<int32_t>(++g_trace_guard_event_seq)});
+#endif
       break;
+#if BSL_WIFI_GUARD_TRACE
+    // trace 専用の追加購読 (計画書 D3 ev 行): guard への pushEvent 対象は上記
+    // 3 種から変更しない。ライブラリ内部の再接続活動 (telemetry の Ops を
+    // 経由しない disconnect();begin();) を op 行の不在に頼らずイベント面で
+    // 可視化するための観測専用購読 (i=- で guard キュー順序とは無関係)。
+    case ARDUINO_EVENT_WIFI_STA_START:
+      g_trace_ring.push({static_cast<uint64_t>(esp_timer_get_time()),
+                         core::trace::EvKind::Start, 0, -1});
+      break;
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      g_trace_ring.push({static_cast<uint64_t>(esp_timer_get_time()),
+                         core::trace::EvKind::Conn, 0, -1});
+      break;
+    case ARDUINO_EVENT_WIFI_SCAN_DONE:
+      g_trace_ring.push({static_cast<uint64_t>(esp_timer_get_time()),
+                         core::trace::EvKind::Scan, 0, -1});
+      break;
+#endif
     default:
       break;
   }
 }
+
+#if BSL_WIFI_GUARD_TRACE
+// tick 末尾 (guard tick()/trySend() 完了後) の st 差分/hb/drop 出力 + 一括
+// フラッシュ (計画書 D11 シーケンシング・D3 印字タイミング)。guard 処理・
+// 送信完了後の 1 箇所のみで呼ぶため、被測定経路 (abort 発行等) を遅延させない。
+void flushTrace(uint32_t tick, bool read_ok, uint8_t fsm, bool arm_pending) {
+  core::trace::StateTuple stt;
+  stt.read_ok = read_ok;
+  stt.fsm = fsm;
+  stt.arm = arm_pending;
+  stt.q = g_guard->lastWifiQuiet();
+  stt.conn = g_guard->connected();
+  stt.cing = g_guard->connecting();
+  stt.udpr = g_guard->udpReady();
+  stt.librp = g_guard->libReconnectPending();
+  stt.ab = g_guard->aborting();
+  stt.roff = g_guard->radioOffPending();
+  stt.latch = g_guard->wifiAbortFailed();
+  stt.pwf = g_guard->prewarmFailTotal();
+  stt.sf = g_guard->sendFailTotal();
+  stt.evo = g_guard->eventOverflowTotal();
+
+  const uint64_t t_us = static_cast<uint64_t>(esp_timer_get_time());
+  g_trace_emitter.endTick(t_us, stt);
+
+  // stkmin: uxTaskGetStackHighWaterMark() は ESP32 port (StackType_t=uint8_t)
+  // では既にバイト単位だが、移植性のため sizeof(StackType_t) を明示乗算して
+  // 「換算バイト」にする (計画書 D3)。ESP.getFreeHeap()/getMinFreeHeap() は
+  // esp_get_free_heap_size()/esp_get_minimum_free_heap_size() の Arduino
+  // ラッパ (計画書 D2 補助証拠。参考情報であり合否条件にはしない)。
+  const uint32_t stkmin_bytes = static_cast<uint32_t>(
+      uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t));
+  g_trace_emitter.maybeHeartbeat(t_us, tick, stt,
+                                 static_cast<uint32_t>(ESP.getFreeHeap()),
+                                 static_cast<uint32_t>(ESP.getMinFreeHeap()),
+                                 stkmin_bytes);
+  g_trace_emitter.maybeEmitDrop(t_us);
+
+  const uint64_t f0 = static_cast<uint64_t>(esp_timer_get_time());
+  if (g_trace_emitter.bufferedBytes() > 0) {
+    Serial.write(reinterpret_cast<const uint8_t*>(g_trace_emitter.bufferData()),
+                g_trace_emitter.bufferedBytes());
+  }
+  const uint64_t fdur = static_cast<uint64_t>(esp_timer_get_time()) - f0;
+  g_trace_emitter.recordFlushDuration(fdur);
+  g_trace_emitter.resetBuffer();
+}
+#endif  // BSL_WIFI_GUARD_TRACE
 
 void telemetryTaskEntry(void*) {
   uint32_t seq = 0;
@@ -89,6 +250,23 @@ void telemetryTaskEntry(void*) {
   uint32_t read_fail_total = 0;
   uint32_t trunc_total = 0;
   char buf[core::kTelemetryBufferBytes];
+
+#if BSL_WIFI_GUARD_TRACE
+  // trace ビルド専用: フラッシュ予算保証のため 921600 baud へ切替 (計画書 D3/D9。
+  // main.cpp の Serial.begin(115200) は不変)。boot 行は一切の guard tick /
+  // Wi-Fi 操作より前に単独でフラッシュする (計画書 D3: 先頭欠落の機械的排除)。
+  Serial.updateBaudRate(921600);
+  g_trace_emitter.emitBoot(static_cast<uint64_t>(esp_timer_get_time()), BSL_FW_GIT,
+                           g_dev_id);
+  {
+    const uint64_t f0 = static_cast<uint64_t>(esp_timer_get_time());
+    Serial.write(reinterpret_cast<const uint8_t*>(g_trace_emitter.bufferData()),
+                g_trace_emitter.bufferedBytes());
+    const uint64_t fdur = static_cast<uint64_t>(esp_timer_get_time()) - f0;
+    g_trace_emitter.recordFlushDuration(fdur);
+    g_trace_emitter.resetBuffer();
+  }
+#endif
 
   TickType_t wake = xTaskGetTickCount();
   for (;;) {
@@ -103,9 +281,28 @@ void telemetryTaskEntry(void*) {
         read_ok && snap.fsm_state == static_cast<uint8_t>(core::FsmState::Balancing);
     const bool arm_pending = read_ok && snap.arm_pending;
 
+#if BSL_WIFI_GUARD_TRACE
+    // tick 冒頭 (guard.tick() 呼び出し前) の tk 行 (計画書 D11 の tick 内
+    // シーケンシング: tk (ep=drain前) → trace リング drain (ev 行化) →
+    // guard tick/trySend (op 記録) → st 差分 → hb/drop → フラッシュ)。
+    // ep は drainedEpoch() を guard.tick() 呼び出し直前に読むことで pre-drain
+    // 契約を満たす (同一スレッド上でこの間に割り込みは入らない)。
+    const uint64_t trace_tick_t_us = static_cast<uint64_t>(esp_timer_get_time());
+    const uint8_t trace_fsm = read_ok ? snap.fsm_state : 0;
+    const uint32_t trace_ep = g_guard->drainedEpoch();
+    g_trace_emitter.beginTick(trace_tick_t_us, read_ok, trace_fsm, arm_pending,
+                              trace_ep);
+    g_trace_emitter.drainRing(g_trace_ring);
+#endif
+
     g_guard->tick(read_ok, read_ok ? snap.loop_count : 0, balancing, arm_pending);
 
-    if (!g_guard->readyToAttempt()) continue;
+    if (!g_guard->readyToAttempt()) {
+#if BSL_WIFI_GUARD_TRACE
+      flushTrace(tick, read_ok, trace_fsm, arm_pending);
+#endif
+      continue;
+    }
 
     // seq は「送信 datagram の通し番号」(計画書 §3.1) であり、trySend が実際に
     // datagram を送出できた場合のみ消費されなければならない。ここではまだ
@@ -190,6 +387,10 @@ void telemetryTaskEntry(void*) {
         seq = seq_candidate;
       }
     }
+
+#if BSL_WIFI_GUARD_TRACE
+    flushTrace(tick, read_ok, trace_fsm, arm_pending);
+#endif
   }
 }
 
@@ -213,6 +414,15 @@ void startTelemetryTask(shared::SharedState& shared_state) {
     o.beginPacket = &OpsBeginPacket;
     o.writePacket = &OpsWritePacket;
     o.endPacket = &OpsEndPacket;
+#if BSL_WIFI_GUARD_TRACE
+    // trace 版に差し替え (計画書 D4)。実 API の呼び出し順序・回数・引数は
+    // 完全に不変 (各 TraceOps* が実 Ops へ委譲するのみ)。write/endPacket は
+    // 確保を伴わないため素の Ops のまま (計画書 D2)。
+    o.begin = &TraceOpsBegin;
+    o.disconnect = &TraceOpsDisconnect;
+    o.setRadioOff = &TraceOpsSetRadioOff;
+    o.beginPacket = &TraceOpsBeginPacket;
+#endif
     return o;
   }();
   static core::WifiGuard::Params params = [] {

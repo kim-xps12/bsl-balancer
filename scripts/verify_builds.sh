@@ -8,6 +8,11 @@
 #       依存する first_connect one-shot 挙動の再確認を強制する)
 #   (1) 既存 include/wifi_secrets.h を退避 → secrets なしビルド (no-op 経路)
 #   (2) wifi_secrets.h.example からダミー生成 → 有効経路ビルド
+#   (2b) 同じダミー secrets のまま trace env (m5stack-core2-trace) をビルド
+#        (wifi-guard-trace 計画書 §4 D6)。trace × ¬secrets は D1 の構造的保証
+#        (trace コードは BSL_TELEMETRY_SECRETS_AVAILABLE 有効領域の内側にしか
+#        存在しないため trace ∧ ¬secrets ≡ ¬secrets) によりビルド対象へ加えない
+#        (レビューでこの構造 = telemetry_task.cpp の #if 入れ子を検査する)。
 #   (3) 退避した元ファイルを復元 (元々存在しなければダミーを削除するのみ)
 set -euo pipefail
 
@@ -64,4 +69,7 @@ echo "[verify_builds] (2) example からダミー生成 → 有効経路ビル�
 cp "$EXAMPLE" "$SECRETS"
 "$PIO" run -e m5stack-core2
 
-echo "[verify_builds] OK: enabled/disabled 両経路のビルドに成功"
+echo "[verify_builds] (2b) trace env (m5stack-core2-trace) × ダミー secrets ビルド"
+"$PIO" run -e m5stack-core2-trace
+
+echo "[verify_builds] OK: enabled/disabled/trace の 3 ビルドに成功"

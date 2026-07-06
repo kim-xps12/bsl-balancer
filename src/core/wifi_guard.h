@@ -285,6 +285,17 @@ class WifiGuard {
   uint32_t wifiAbortFailedTotal() const { return wifi_abort_failed_total_; }
   uint32_t eventOverflowTotal() const { return event_overflow_total_; }
 
+  // ---- additive アクセサ (wifi-guard-trace 計画書 §4 D3/§5 参照) ----
+  // 既存 last_wifi_quiet_/epoch_ の読み出しのみ。ロジック・タイミングは無変更
+  // (SafetyFsm::armPending() と同じ additive アクセサパターン)。
+  // lastWifiQuiet(): 直近 tick で計算済みの WIFI_QUIET (trace の op 行 `q=` に
+  // 使う。stale snapshot による QUIET も含めて判定できるようにするため)。
+  bool lastWifiQuiet() const { return last_wifi_quiet_; }
+  // drainedEpoch(): これまでに drain 消費したイベント累積数 (trace の tk 行
+  // `ep=` に使う。呼び出し側が guard.tick() 呼び出し **直前** に読むことで
+  // 「drain 前」の値になる契約は呼び出し側が担保する)。
+  uint32_t drainedEpoch() const { return epoch_; }
+
  private:
   struct QueuedEvent {
     EventKind kind;

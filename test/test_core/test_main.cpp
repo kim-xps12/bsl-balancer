@@ -5,7 +5,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <thread>
 
 #include "../../src/core/attitude_estimator.h"
@@ -15,6 +17,7 @@
 #include "../../src/core/pid.h"
 #include "../../src/core/safety_fsm.h"
 #include "../../src/core/telemetry_format.h"
+#include "../../src/core/trace_emitter.h"
 #include "../../src/core/units.h"
 #include "../../src/core/wifi_guard.h"
 #include "../../src/shared/shared_state.h"
@@ -1514,6 +1517,476 @@ static void test_wifi_guard_event_queue_overflow_triggers_abort_and_reset() {
   TEST_ASSERT_EQUAL_UINT32(1u, g.eventOverflowTotal());  // 累積カウンタは保持される
 }
 
+// ---------------- WifiGuard: additive アクセサ lastWifiQuiet()/drainedEpoch()
+// (wifi-guard-trace 計画書 §4 D3/§5) ----------------
+// 既存 last_wifi_quiet_/epoch_ の読み出しのみであることを検証する (ロジック・
+// タイミングは無変更。SafetyFsm::armPending() と同じ additive アクセサ)。
+
+static void test_wifi_guard_last_wifi_quiet_and_drained_epoch_accessors() {
+  FakeWifiState st;
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  WifiGuard g(makeFakeOps(&st), p);
+
+  TEST_ASSERT_EQUAL_UINT32(0u, g.drainedEpoch());
+
+  g.tick(true, 1, false, false);  // 初回観測: fresh 未確定 → quiet
+  TEST_ASSERT_TRUE(g.lastWifiQuiet());
+  TEST_ASSERT_EQUAL_UINT32(0u, g.drainedEpoch());  // イベントなし → epoch 不変
+
+  g.tick(true, 2, false, false);  // fresh 確立・非Balancing・非arm_pending → 非quiet
+  TEST_ASSERT_FALSE(g.lastWifiQuiet());
+  TEST_ASSERT_EQUAL_UINT32(0u, g.drainedEpoch());
+
+  g.pushEvent(WifiGuard::EventKind::GotIp);
+  g.tick(true, 3, false, false);  // この tick の drain で epoch が 1 進む
+  TEST_ASSERT_EQUAL_UINT32(1u, g.drainedEpoch());
+  TEST_ASSERT_TRUE(g.connected());
+  TEST_ASSERT_FALSE(g.lastWifiQuiet());
+
+  g.tick(true, 4, /*balancing=*/true, false);  // Balancing → quiet
+  TEST_ASSERT_TRUE(g.lastWifiQuiet());
+  TEST_ASSERT_EQUAL_UINT32(1u, g.drainedEpoch());  // イベントなし tick では不変
+}
+
+// ---------------- trace_emitter: grammar v1 + tick 内シーケンシング
+// (wifi-guard-trace 計画書 D3/D10/D11) ----------------
+// WifiGuard + TraceEmitter + フェイク Ops (trace 記録ラッパ付き) を駆動し、
+// D11 が要求する「両インターリーブでの ep pre-drain 保証」「行順序・grammar
+// 一致」「s の連続性」「レコード種別ごとの最大行長」を検証する。
+
+namespace {
+
+// telemetry_task.cpp の TraceOps* ラッパと同じ役割 (実 Ops 委譲 + recordOp())
+// を native (FakeWifiState) で再現するハーネス。ctx = &TraceHarness を全 Ops
+// 関数で共有する。
+struct TraceHarness {
+  FakeWifiState st;
+  core::trace::TraceEmitter emitter;
+  core::trace::TraceEventRing ring;
+  WifiGuard* guard = nullptr;  // 構築後 (ops 生成後) に外部から設定する
+  uint32_t guard_event_seq = 0;
+  uint64_t clock_us = 1000;  // 決定的な固定系列で進める (壁時計は使わない)
+  uint32_t tick_num = 0;
+  uint8_t last_tick_fsm = 0;
+  bool last_tick_arm = false;
+
+  // Wi-Fi イベント到着を模擬する: guard への pushEvent → trace ring への push
+  // の順で行う (計画書 D3 ev.i の前提となる単一 producer の順序と同じ)。
+  void injectEvent(WifiGuard::EventKind kind, uint8_t reason, core::trace::EvKind tk) {
+    guard->pushEvent(kind, reason);
+    ring.push(core::trace::TraceEvent{clock_us, tk, reason,
+                                      static_cast<int32_t>(++guard_event_seq)});
+    clock_us += 10;
+  }
+
+  // tick 冒頭: telemetry_task.cpp と同じ順序 (ep 読み取り → tk 出力 →
+  // trace リング drain) を guard.tick() 呼び出し **前** に行う。呼び出し側が
+  // この関数の前後で injectEvent() を呼ぶことで両インターリーブを再現できる。
+  uint32_t beginTick(uint8_t fsm, bool arm) {
+    ++tick_num;
+    last_tick_fsm = fsm;
+    last_tick_arm = arm;
+    const uint32_t ep = guard->drainedEpoch();
+    clock_us += 1000;
+    emitter.beginTick(clock_us, true, fsm, arm, ep);
+    emitter.drainRing(ring);
+    return ep;
+  }
+
+  core::trace::StateTuple snapshotTuple() const {
+    core::trace::StateTuple s;
+    s.read_ok = true;
+    s.fsm = last_tick_fsm;
+    s.arm = last_tick_arm;
+    s.q = guard->lastWifiQuiet();
+    s.conn = guard->connected();
+    s.cing = guard->connecting();
+    s.udpr = guard->udpReady();
+    s.librp = guard->libReconnectPending();
+    s.ab = guard->aborting();
+    s.roff = guard->radioOffPending();
+    s.latch = guard->wifiAbortFailed();
+    s.pwf = guard->prewarmFailTotal();
+    s.sf = guard->sendFailTotal();
+    s.evo = guard->eventOverflowTotal();
+    return s;
+  }
+
+  // tick 末尾: st 差分 → hb (20 tick ごと) → drop (evdrop 増加時)。
+  void endTick() {
+    clock_us += 100;
+    emitter.endTick(clock_us, snapshotTuple());
+    emitter.maybeHeartbeat(clock_us, tick_num, snapshotTuple(), /*heap=*/100000,
+                           /*heapmin=*/90000, /*stkmin=*/4096);
+    emitter.maybeEmitDrop(clock_us);
+  }
+
+  // このtick分の行を文字列へ flush し、次tickに備えてバッファをリセットする
+  // (本番の Serial.write + resetBuffer() と同じ「1 tick 分ずつ書き出す」動作)。
+  void flushTo(std::string* out) {
+    out->append(emitter.bufferData(), emitter.bufferedBytes());
+    emitter.resetBuffer();
+  }
+};
+
+void HarnessBegin(void* ctx) {
+  auto* h = static_cast<TraceHarness*>(ctx);
+  const uint64_t t0 = h->clock_us;
+  FakeBegin(&h->st);
+  h->clock_us += 50;
+  h->emitter.recordOp(core::trace::OpKind::Begin, t0, h->clock_us - t0,
+                      /*res_valid=*/false, 0, h->guard->lastWifiQuiet(),
+                      h->guard->udpReady());
+}
+bool HarnessDisconnect(void* ctx) {
+  auto* h = static_cast<TraceHarness*>(ctx);
+  const uint64_t t0 = h->clock_us;
+  const bool res = FakeDisconnect(&h->st);
+  h->clock_us += 50;
+  h->emitter.recordOp(core::trace::OpKind::Disc, t0, h->clock_us - t0,
+                      /*res_valid=*/true, res ? 1 : 0, h->guard->lastWifiQuiet(),
+                      h->guard->udpReady());
+  return res;
+}
+void HarnessSetRadioOff(void* ctx) {
+  auto* h = static_cast<TraceHarness*>(ctx);
+  const uint64_t t0 = h->clock_us;
+  FakeSetRadioOff(&h->st);
+  h->clock_us += 50;
+  h->emitter.recordOp(core::trace::OpKind::RadioOff, t0, h->clock_us - t0,
+                      /*res_valid=*/false, 0, h->guard->lastWifiQuiet(),
+                      h->guard->udpReady());
+}
+bool HarnessIsRadioOff(void* ctx) { return FakeIsRadioOff(&static_cast<TraceHarness*>(ctx)->st); }
+int HarnessBeginPacket(void* ctx) {
+  auto* h = static_cast<TraceHarness*>(ctx);
+  // native ハーネスには SharedState が無いため、この tick で guard に渡した
+  // snapshot 文脈 (beginTick() に渡したものと同じ) を pre/post 双方の再サンプル
+  // 代わりに使う (実機では telemetry_task.cpp が SharedState を都度 read する。
+  // ここでの目的は「resample フィールドが recordOp に正しく伝播し grammar
+  // どおり出力されること」の検証であり、実機の即時再サンプル自体は
+  // TraceOpsBeginPacket 側の責務)。
+  core::trace::OpResample resample;
+  resample.read_ok2 = true;
+  resample.fsm2 = h->last_tick_fsm;
+  resample.arm2 = h->last_tick_arm;
+  const uint64_t t0 = h->clock_us;
+  const int res = FakeBeginPacket(&h->st);
+  h->clock_us += 50;
+  resample.read_ok3 = true;
+  resample.fsm3 = h->last_tick_fsm;
+  resample.arm3 = h->last_tick_arm;
+  h->emitter.recordOp(core::trace::OpKind::Bp, t0, h->clock_us - t0,
+                      /*res_valid=*/true, res, h->guard->lastWifiQuiet(),
+                      h->guard->udpReady(), resample);
+  return res;
+}
+int HarnessWritePacket(void* ctx, const uint8_t* buf, size_t len) {
+  return FakeWritePacket(&static_cast<TraceHarness*>(ctx)->st, buf, len);
+}
+int HarnessEndPacket(void* ctx) { return FakeEndPacket(&static_cast<TraceHarness*>(ctx)->st); }
+
+WifiOps makeHarnessOps(TraceHarness* h) {
+  WifiOps o;
+  o.ctx = h;
+  o.begin = &HarnessBegin;
+  o.disconnect = &HarnessDisconnect;
+  o.setRadioOff = &HarnessSetRadioOff;
+  o.isRadioOff = &HarnessIsRadioOff;
+  o.beginPacket = &HarnessBeginPacket;
+  o.writePacket = &HarnessWritePacket;
+  o.endPacket = &HarnessEndPacket;
+  return o;
+}
+
+// telemetry_task.cpp の 1 tick 分 (tk → drain → guard.tick()/trySend() →
+// st/hb/drop → flush) を丸ごと再現する駆動ヘルパ。
+void runTraceTick(TraceHarness& h, WifiGuard& g, uint32_t loop_count, uint8_t fsm,
+                  bool arm, std::string* log_out) {
+  h.beginTick(fsm, arm);
+  const bool balancing = fsm == static_cast<uint8_t>(FsmState::Balancing);
+  g.tick(true, loop_count, balancing, arm);
+  if (g.readyToAttempt()) {
+    const uint8_t payload[4] = {1, 2, 3, 4};
+    g.trySend(payload, sizeof(payload));
+  }
+  h.endTick();
+  h.flushTo(log_out);
+}
+
+enum class LineKind { Boot, Tk, Ev, Op, St, Hb, Drop, Unknown };
+
+LineKind classifyLine(const std::string& line) {
+  if (line.find(" boot ") != std::string::npos) return LineKind::Boot;
+  if (line.find(" tk ") != std::string::npos) return LineKind::Tk;
+  if (line.find(" ev=") != std::string::npos) return LineKind::Ev;
+  if (line.find(" op=") != std::string::npos) return LineKind::Op;
+  if (line.find(" hb ") != std::string::npos) return LineKind::Hb;
+  if (line.find(" st ") != std::string::npos) return LineKind::St;
+  if (line.find(" drop ") != std::string::npos) return LineKind::Drop;
+  return LineKind::Unknown;
+}
+
+size_t maxLineBytesFor(LineKind k) {
+  switch (k) {
+    case LineKind::Boot: return core::trace::kMaxLineBoot;
+    case LineKind::Tk: return core::trace::kMaxLineTk;
+    case LineKind::Ev: return core::trace::kMaxLineEv;
+    case LineKind::Op: return core::trace::kMaxLineOp;
+    case LineKind::St: return core::trace::kMaxLineSt;
+    case LineKind::Hb: return core::trace::kMaxLineHb;
+    case LineKind::Drop: return core::trace::kMaxLineDrop;
+    case LineKind::Unknown: return 0;
+  }
+  return 0;
+}
+
+// 全行が "[WG1] s=" で始まり s が連続していることを assert する (ゲート1
+// 第16回指摘1対応)。フラグメント (tick 単位で flush・クリアした一部分の
+// ログ) を渡す呼び出し側があるため、連続性は「渡された断片内での相対的な
+// 連続性」(先頭行の s から単調 +1) で検証する。真の起点 (s=1) からの連続性は
+// test_trace_emitter_boot_line_format (新規 TraceEmitter からの単一ログ) で
+// 別途確認する。同時に各行を種別ごとの宣言最大行長 (kMaxLineXxx) 以内に
+// 収まっているかも assert する (D3 バースト予算の実測固定)。行末の改行文字を
+// 含めた長さで比較する (TraceEmitter::appendLine が数える単位と一致させる)。
+void assertGrammarSequenceAndLength(const std::string& log) {
+  size_t pos = 0;
+  uint32_t expected_s = 0;
+  bool have_expected = false;
+  while (pos < log.size()) {
+    const size_t nl = log.find('\n', pos);
+    TEST_ASSERT_TRUE(nl != std::string::npos);
+    const size_t line_len_with_nl = nl - pos + 1;
+    const std::string line = log.substr(pos, nl - pos);
+    TEST_ASSERT_EQUAL_INT(0, line.compare(0, 8, "[WG1] s="));
+    unsigned s = 0;
+    TEST_ASSERT_EQUAL_INT(1, std::sscanf(line.c_str() + 8, "%u", &s));
+    if (!have_expected) {
+      expected_s = s;
+      have_expected = true;
+    }
+    TEST_ASSERT_EQUAL_UINT32(expected_s, s);
+    ++expected_s;
+
+    const LineKind kind = classifyLine(line);
+    TEST_ASSERT_TRUE(kind != LineKind::Unknown);
+    TEST_ASSERT_TRUE(line_len_with_nl <= maxLineBytesFor(kind));
+
+    pos = nl + 1;
+  }
+}
+
+}  // namespace
+
+static void test_trace_emitter_boot_line_format() {
+  core::trace::TraceEmitter emitter;
+  emitter.emitBoot(12345, "abc123ff", "core2-abcd");
+  const std::string log(emitter.bufferData(), emitter.bufferedBytes());
+  TEST_ASSERT_EQUAL_INT(0, log.compare(0, 8, "[WG1] s="));
+  TEST_ASSERT_NOT_NULL(strstr(log.c_str(), " t=12345 boot v=1 fw=abc123ff dev=core2-abcd\n"));
+  assertGrammarSequenceAndLength(log);
+}
+
+// tick 内シーケンシング (D11): tk → ev → op(=bp, resample 付き) → st の順で
+// 1 tick 分の行が出力されること、grammar v1 の各フィールドが規定どおりで
+// あることを検証する (ゲート1第14回指摘2: op=bp の fsm2/arm2/fsm3/arm3 必須)。
+static void test_trace_emitter_tick_order_and_bp_resample_fields() {
+  TraceHarness h;
+  WifiOps ops = makeHarnessOps(&h);
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  WifiGuard g(ops, p);
+  h.guard = &g;
+  std::string log;
+
+  // tick1: fresh 未確定 → quiet (op 行なし)
+  runTraceTick(h, g, 1, static_cast<uint8_t>(FsmState::Idle), false, &log);
+  log.clear();
+  // tick2: fresh 確立・非quiet → begin 発行 (op=begin)
+  runTraceTick(h, g, 2, static_cast<uint8_t>(FsmState::Idle), false, &log);
+  TEST_ASSERT_EQUAL(1, h.st.begin_calls);
+  TEST_ASSERT_NOT_NULL(strstr(log.c_str(), " op=begin "));
+  log.clear();
+
+  // tick3: GOT_IP 到着 (ev=gotip i=1) → 接続成立 → prewarm 送信 (op=bp)
+  h.injectEvent(WifiGuard::EventKind::GotIp, 0, core::trace::EvKind::GotIp);
+  runTraceTick(h, g, 3, static_cast<uint8_t>(FsmState::Idle), false, &log);
+  TEST_ASSERT_TRUE(g.connected());
+  TEST_ASSERT_TRUE(g.udpReady());
+
+  assertGrammarSequenceAndLength(log);
+
+  // 行順序: tk → ev=gotip → op=bp → st (状態が conn/cing/udpr で変化している)
+  const size_t pos_tk = log.find(" tk ");
+  const size_t pos_ev = log.find(" ev=gotip");
+  const size_t pos_op = log.find(" op=bp");
+  const size_t pos_st = log.find(" st ");
+  TEST_ASSERT_TRUE(pos_tk != std::string::npos);
+  TEST_ASSERT_TRUE(pos_ev != std::string::npos);
+  TEST_ASSERT_TRUE(pos_op != std::string::npos);
+  TEST_ASSERT_TRUE(pos_st != std::string::npos);
+  TEST_ASSERT_TRUE(pos_tk < pos_ev);
+  TEST_ASSERT_TRUE(pos_ev < pos_op);
+  TEST_ASSERT_TRUE(pos_op < pos_st);
+
+  // ev=gotip: guard 対象イベントなので i=1 (到着通し番号)
+  TEST_ASSERT_NOT_NULL(strstr(log.c_str(), " ev=gotip r=- i=1\n"));
+
+  // op=bp: resample フィールド (fsm2/arm2/fsm3/arm3) が必須で付加されていること
+  const size_t op_line_end = log.find('\n', pos_op);
+  const std::string op_line = log.substr(pos_op, op_line_end - pos_op);
+  TEST_ASSERT_NOT_NULL(strstr(op_line.c_str(), "fsm2="));
+  TEST_ASSERT_NOT_NULL(strstr(op_line.c_str(), "arm2="));
+  TEST_ASSERT_NOT_NULL(strstr(op_line.c_str(), "fsm3="));
+  TEST_ASSERT_NOT_NULL(strstr(op_line.c_str(), "arm3="));
+  // udpr は op 実行時点 (beginPacket 呼び出し中) の udpReady() であり、prewarm
+  // 完了 (udp_ready_=true) は trySend の endPacket 成功後に初めて立つため、
+  // この最初の bp (prewarm-class) の時点ではまだ udpr=0 が正しい (計画書 D3 R4:
+  // 「udpr=0 の bp = malloc/socket 作成が起き得る呼び出し」の定義と整合する)。
+  TEST_ASSERT_NOT_NULL(strstr(op_line.c_str(), "udpr=0"));
+  TEST_ASSERT_TRUE(g.udpReady());  // trySend 完了後 (このtick終了時点) は true
+}
+
+// trace 専用の追加購読 (start/conn/scan) は guard キュー順序と無関係な i=- で
+// 出力されること (計画書 D3 ev 行)。
+static void test_trace_emitter_ev_extra_subscriptions_have_no_i() {
+  TraceHarness h;
+  WifiOps ops = makeHarnessOps(&h);
+  WifiGuard::Params p;
+  WifiGuard g(ops, p);
+  h.guard = &g;
+  std::string log;
+
+  h.injectEvent(WifiGuard::EventKind::GotIp, 0, core::trace::EvKind::Start);
+  // Start は guard 対象ではないため本来 guard->pushEvent は呼ばないが、この
+  // テストでは i=- の grammar のみを確認したいので直接 ring へ push する。
+  h.ring.push(core::trace::TraceEvent{h.clock_us, core::trace::EvKind::Conn, 0, -1});
+  h.ring.push(core::trace::TraceEvent{h.clock_us, core::trace::EvKind::Scan, 0, -1});
+  runTraceTick(h, g, 1, static_cast<uint8_t>(FsmState::Idle), false, &log);
+
+  TEST_ASSERT_NOT_NULL(strstr(log.c_str(), " ev=conn r=- i=-\n"));
+  TEST_ASSERT_NOT_NULL(strstr(log.c_str(), " ev=scan r=- i=-\n"));
+}
+
+// hb は 20 tick ごとに出力され、heap/heapmin/evdrop/flmax/stkmin/tick を含む
+// こと (計画書 D3)。
+static void test_trace_emitter_heartbeat_every_20_ticks() {
+  TraceHarness h;
+  WifiOps ops = makeHarnessOps(&h);
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  WifiGuard g(ops, p);
+  h.guard = &g;
+  std::string log;
+
+  for (uint32_t t = 1; t <= 19; ++t) {
+    runTraceTick(h, g, t, static_cast<uint8_t>(FsmState::Idle), false, &log);
+  }
+  TEST_ASSERT_TRUE(log.find(" hb ") == std::string::npos);
+  log.clear();
+
+  runTraceTick(h, g, 20, static_cast<uint8_t>(FsmState::Idle), false, &log);
+  TEST_ASSERT_TRUE(log.find(" hb ") != std::string::npos);
+  TEST_ASSERT_NOT_NULL(strstr(log.c_str(), "heap="));
+  TEST_ASSERT_NOT_NULL(strstr(log.c_str(), "heapmin="));
+  TEST_ASSERT_NOT_NULL(strstr(log.c_str(), "evdrop="));
+  TEST_ASSERT_NOT_NULL(strstr(log.c_str(), "flmax="));
+  TEST_ASSERT_NOT_NULL(strstr(log.c_str(), "stkmin="));
+  TEST_ASSERT_NOT_NULL(strstr(log.c_str(), "tick=20"));
+  assertGrammarSequenceAndLength(log);
+}
+
+// trace リング (容量16) の満杯破棄は evdrop に計上され、その tick 中に
+// (1Hzのhbを待たずに) drop 行として自己申告される (計画書 D3)。
+static void test_trace_emitter_ring_overflow_emits_drop_line() {
+  TraceHarness h;
+  WifiOps ops = makeHarnessOps(&h);
+  WifiGuard::Params p;
+  p.reconnect_backoff_ticks = 0;
+  WifiGuard g(ops, p);
+  h.guard = &g;
+  std::string log;
+
+  runTraceTick(h, g, 1, static_cast<uint8_t>(FsmState::Idle), false, &log);
+  log.clear();
+
+  for (int i = 0; i < 20; ++i) {
+    h.injectEvent(WifiGuard::EventKind::GotIp, 0, core::trace::EvKind::GotIp);
+  }
+  runTraceTick(h, g, 2, static_cast<uint8_t>(FsmState::Idle), false, &log);
+
+  TEST_ASSERT_TRUE(h.emitter.evdropTotal() > 0);
+  TEST_ASSERT_TRUE(log.find(" drop n=") != std::string::npos);
+  assertGrammarSequenceAndLength(log);
+}
+
+// ---- D11 ep pre-drain 契約: 両インターリーブ (ゲート1第7回・第9回指摘) ----
+// tk 行の ep (drainedEpoch()) は常に「この tick の guard.tick() が実際に
+// drain する直前」の値でなければならない。イベント到着タイミングを 2 通りに
+// 制御し、どちらの場合も ep が最新の (この tick で drain される) イベントを
+// 含んでいないことを検証する。
+
+// (1) 「tk 記録後・guard drain 前」にイベント到着: tk の ep 読み取り・出力が
+// 終わった直後、guard.tick() 呼び出し直前に push する。guard はこの tick 内で
+// このイベントを drain する (epoch が 0→1) が、既に出力済みの tk.ep は 0 の
+// ままでなければならない。
+static void test_trace_emitter_tk_ep_predrain_event_between_tk_and_guard_tick() {
+  TraceHarness h;
+  WifiOps ops = makeHarnessOps(&h);
+  WifiGuard::Params p;
+  WifiGuard g(ops, p);
+  h.guard = &g;
+
+  const uint32_t ep_before =
+      h.beginTick(static_cast<uint8_t>(FsmState::Idle), false);
+  TEST_ASSERT_EQUAL_UINT32(0u, ep_before);
+  TEST_ASSERT_EQUAL_UINT32(0u, g.drainedEpoch());  // まだ何も drain されていない
+
+  // tk 記録後・guard.tick() 呼び出し前にイベント到着 (ゲート1第7回指摘の再現条件)。
+  h.injectEvent(WifiGuard::EventKind::StaStop, 0, core::trace::EvKind::Stop);
+
+  g.tick(true, 1, false, false);  // この tick 内でイベントが drain される
+
+  TEST_ASSERT_EQUAL_UINT32(1u, g.drainedEpoch());  // drain 済み (epoch が進んだ)
+  TEST_ASSERT_EQUAL_UINT32(0u, ep_before);  // だが tk 行に記された ep は pre-drain 値
+
+  std::string log;
+  h.endTick();
+  h.flushTo(&log);
+  // 出力済みの tk 行自体にも ep=0 が刻まれていること (文字列としても確認)。
+  TEST_ASSERT_NOT_NULL(strstr(log.c_str(), " tk fsm=1 arm=0 ep=0\n"));
+}
+
+// (2) 「guard drain 後・次tick の tk 前」にイベント到着: このtickではまだ
+// drain されず、次 tick の tk (ep 読み取り) もこのイベントを含まない
+// (T+1 の drain で初めて反映される)。
+static void test_trace_emitter_tk_ep_predrain_event_after_guard_tick_before_next_tk() {
+  TraceHarness h;
+  WifiOps ops = makeHarnessOps(&h);
+  WifiGuard::Params p;
+  WifiGuard g(ops, p);
+  h.guard = &g;
+
+  const uint32_t ep1 = h.beginTick(static_cast<uint8_t>(FsmState::Idle), false);
+  g.tick(true, 1, false, false);
+  TEST_ASSERT_EQUAL_UINT32(0u, ep1);
+  TEST_ASSERT_EQUAL_UINT32(0u, g.drainedEpoch());  // tick1 は無イベントで drain 済み量0
+  h.endTick();
+  h.emitter.resetBuffer();
+
+  // guard.tick() (drain) 完了後・次 tick の tk 前にイベント到着。
+  h.injectEvent(WifiGuard::EventKind::StaStop, 0, core::trace::EvKind::Stop);
+
+  const uint32_t ep2 = h.beginTick(static_cast<uint8_t>(FsmState::Idle), false);
+  TEST_ASSERT_EQUAL_UINT32(0u, ep2);  // tick2 の tk.ep はこのイベントをまだ含まない
+  TEST_ASSERT_EQUAL_UINT32(0u, g.drainedEpoch());  // 直前まで未 drain であることの裏付け
+
+  g.tick(true, 2, false, false);  // ここで初めて drain される
+  TEST_ASSERT_EQUAL_UINT32(1u, g.drainedEpoch());
+  h.endTick();
+}
+
 // ---------------- 統合: armPending() が Wi-Fi 接続を Balancing 前に abort する ----------------
 // (計画書 §3.1: commissioned auto-arm と BtnC 手動アームの両経路で同一機構であることの確認)
 
@@ -1691,6 +2164,17 @@ int main(int, char**) {
   RUN_TEST(test_wifi_guard_disconnect_clears_udp_ready_blocks_quiet_send_after_reconnect);
   RUN_TEST(test_wifi_guard_own_begin_completes_during_quiet_aborts_once);
   RUN_TEST(test_wifi_guard_event_queue_overflow_triggers_abort_and_reset);
+
+  // wifi-guard-trace 計画書: additive アクセサ + trace_emitter (D3/D10/D11)
+  RUN_TEST(test_wifi_guard_last_wifi_quiet_and_drained_epoch_accessors);
+  RUN_TEST(test_trace_emitter_boot_line_format);
+  RUN_TEST(test_trace_emitter_tick_order_and_bp_resample_fields);
+  RUN_TEST(test_trace_emitter_ev_extra_subscriptions_have_no_i);
+  RUN_TEST(test_trace_emitter_heartbeat_every_20_ticks);
+  RUN_TEST(test_trace_emitter_ring_overflow_emits_drop_line);
+  RUN_TEST(test_trace_emitter_tk_ep_predrain_event_between_tk_and_guard_tick);
+  RUN_TEST(test_trace_emitter_tk_ep_predrain_event_after_guard_tick_before_next_tk);
+
   RUN_TEST(test_integration_wifi_abort_before_balancing_auto_arm);
   RUN_TEST(test_integration_wifi_abort_before_balancing_manual_arm);
   RUN_TEST(test_shared_state_concurrent_publish_read_no_torn_read);
