@@ -3,7 +3,9 @@
 #include <Arduino.h>
 #include <cmath>
 
+#include "../core/dxl_verify.h"
 #include "../core/units.h"
+#include "../core/watchdog_policy.h"
 
 namespace hw {
 namespace {
@@ -49,13 +51,18 @@ bool DxlWithRxInfo::writeVerified(uint8_t id, uint16_t addr, const uint8_t* data
   }
   uint8_t rxbuf[32];
   const InfoToParseDXLPacket_t* rx = rxStatusPacket(rxbuf, sizeof(rxbuf), timeout_ms);
-  if (rx == nullptr) return false;
-  if (rx->id != id) return false;       // 他 ID/残留応答の誤消費を拒否 (§4.2)
-  if (rx->err_idx != 0) return false;   // ALERT(0x80) 含む非零は安全側へ
-  // WRITE の Status はパラメータ 0 バイト。前回 READ の遅延応答 (データ付き)
-  // を配達証明として誤受理しない
-  if (rx->recv_param_len != 0) return false;
-  return true;
+  // view 構築 (§3.1 call-site 契約: rx==nullptr 時にフィールドへ一切触れない。
+  // 引数評価は関数呼出し前に行われるため rx->field を引数式に書かない)
+  core::DxlStatusView st;
+  if (rx != nullptr) {
+    st.ok = true;
+    st.id = rx->id;
+    st.err_idx = rx->err_idx;
+    st.recv_param_len = rx->recv_param_len;
+  }
+  // 受理判定は core::isWriteStatusVerified へ抽出済み (段階1a。他 ID/残留
+  // 応答の誤消費・ALERT(0x80) 含む非零・前回 READ の遅延応答誤受理を拒否)
+  return core::isWriteStatusVerified(st, id);
 }
 
 bool DxlWithRxInfo::readVerified(uint8_t id, uint16_t addr, uint16_t len,
@@ -68,12 +75,20 @@ bool DxlWithRxInfo::readVerified(uint8_t id, uint16_t addr, uint16_t len,
   if (!txInstPacket(id, DXL_INST_READ, param, 4)) return false;
   uint8_t rxbuf[32];
   const InfoToParseDXLPacket_t* rx = rxStatusPacket(rxbuf, sizeof(rxbuf), timeout_ms);
-  if (rx == nullptr) return false;
-  if (rx->id != id) return false;
-  if (rx->recv_param_len != len) return false;
-  // READ の ALERT はデータ有効 (HW エラー通知はヘルス側で扱う) — err の
-  // ALERT ビット以外 (Instruction/CRC 等の Result Fail) は失敗扱い
-  if ((rx->err_idx & 0x7F) != 0) return false;
+  // view 構築 (§3.1 call-site 契約: rx==nullptr 時にフィールドへ一切触れない)
+  core::DxlStatusView st;
+  if (rx != nullptr) {
+    st.ok = true;
+    st.id = rx->id;
+    st.err_idx = rx->err_idx;
+    st.recv_param_len = rx->recv_param_len;
+  }
+  // 受理判定は core::isReadStatusVerified へ抽出済み (段階1a。READ の ALERT
+  // はデータ有効 — err の ALERT ビット以外 (Instruction/CRC 等の Result
+  // Fail) は失敗扱い)
+  if (!core::isReadStatusVerified(st, id, len)) return false;
+  // データコピーは成功時のみ実行 (現行と同順序。st.ok==true が保証されて
+  // いるためこの時点で rx は非 nullptr)
   for (uint16_t i = 0; i < len; ++i) buf[i] = rx->p_param_buf[i];
   return true;
 }
@@ -369,32 +384,37 @@ bool DxlBackend::watchdogRecoverOne(uint8_t id) {
 }
 
 WatchdogCheck DxlBackend::checkWatchdog(bool torque_may_be_on, float now_s) {
-  // §4.3: 判定根拠は両輪の実測 (raw98 + Torque Enable 読み戻し)
-  uint8_t wd[2];
-  for (int k = 0; k < 2; ++k) {
-    if (!readRaw(kIds[k], kAddrBusWatchdog, 1, &wd[k])) {
-      // dt 起因検査で raw98 が読めない場合: トルク有効中なら fail-closed
-      return torque_may_be_on ? WatchdogCheck::Fault : WatchdogCheck::Ok;
-    }
-  }
-  const bool tripped = (wd[0] == kWatchdogTripped) || (wd[1] == kWatchdogTripped);
-  if (!tripped) return WatchdogCheck::Ok;
+  // §4.3: 判定根拠は両輪の実測 (raw98 + Torque Enable 読み戻し)。判断は
+  // core::WatchdogDecision (逐次リデューサ) へ抽出済みで、ここは I/O の
+  // 位置・回数・順序を現行と同一に保つだけ (段階1b。
+  // docs/plans/2026-07-06-safety-core-extraction.md §3.2)。
+  core::WatchdogDecision decision(torque_may_be_on, kWatchdogTripped);
 
-  // Torque Enable 読み戻し (集約規則: 両輪成功かつ両輪 0 のみ自動復旧)
-  uint8_t te[2];
-  for (int k = 0; k < 2; ++k) {
-    if (!readRaw(kIds[k], kAddrTorqueEnable, 1, &te[k])) return WatchdogCheck::Fault;
+  // raw98 読取ループ: L→R の順、Pending 以外を返した時点で以降を読まない
+  // (早期 return の I/O 回数同一性)
+  core::WatchdogVerdict verdict = core::WatchdogVerdict::Pending;
+  for (int k = 0; k < 2 && verdict == core::WatchdogVerdict::Pending; ++k) {
+    uint8_t wd = 0;
+    const bool ok = readRaw(kIds[k], kAddrBusWatchdog, 1, &wd);
+    verdict = decision.feedRaw(ok, wd);
   }
-  if (te[0] != 0 || te[1] != 0) return WatchdogCheck::Fault;
+  if (verdict == core::WatchdogVerdict::Ok) return WatchdogCheck::Ok;
+  if (verdict == core::WatchdogVerdict::Fault) return WatchdogCheck::Fault;
 
-  // 復旧頻度制限 (60s 内 3 回で FAULT)
-  if (recover_count_ == 0 ||
-      (now_s - recover_window_start_s_) > cfg::kWatchdogRecoverWindowS) {
-    recover_count_ = 0;
-    recover_window_start_s_ = now_s;
+  // ここまで到達 = トリップ検出 (Pending)。Torque Enable 読み戻しへ
+  // (集約規則: 両輪成功かつ両輪 0 のみ自動復旧)。同様に L→R・早期打切り。
+  for (int k = 0; k < 2 && verdict == core::WatchdogVerdict::Pending; ++k) {
+    uint8_t te = 0;
+    const bool ok = readRaw(kIds[k], kAddrTorqueEnable, 1, &te);
+    verdict = decision.feedTe(ok, te);
   }
-  // 「60s 内 3 回で FAULT」= 自動復旧を許すのは 2 回まで、3 回目の発生で FAULT
-  if (++recover_count_ >= cfg::kWatchdogRecoverMaxCount) return WatchdogCheck::Fault;
+  if (verdict == core::WatchdogVerdict::Fault) return WatchdogCheck::Fault;
+
+  // verdict == ProceedRecover: 復旧頻度制限 (60s 内 3 回で FAULT)
+  if (!limiter_.allow(now_s, cfg::kWatchdogRecoverWindowS,
+                       cfg::kWatchdogRecoverMaxCount)) {
+    return WatchdogCheck::Fault;
+  }
 
   for (uint8_t id : kIds) {
     if (!watchdogRecoverOne(id)) return WatchdogCheck::Fault;

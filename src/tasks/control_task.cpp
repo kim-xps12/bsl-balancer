@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <cmath>
 
+#include "../core/plausibility_monitor.h"
 #include "../core/units.h"
 
 namespace tasks {
@@ -11,26 +12,9 @@ namespace {
 using core::FaultReason;
 using core::FsmAction;
 using core::FsmState;
+using core::PlausibilityMonitor;
 
 float nowSeconds() { return static_cast<float>(esp_timer_get_time()) * 1e-6f; }
-
-// 電流妥当性監視 (§6): dwell 付きの単純な監視器
-class PlausibilityMonitor {
- public:
-  // torque_on 中: |I_pres−I_cmd| 乖離、torque_off: 残留電流を監視
-  bool update(bool torque_on, bool fb_valid, float i_cmd, float i_pres, float dt) {
-    if (!fb_valid) return false;  // stale 帰還では判定しない
-    const float err = std::fabs(i_pres - i_cmd);
-    const bool bad = torque_on ? (err > cfg::kCurrentMismatchA)
-                               : (std::fabs(i_pres) > cfg::kCurrentResidualA);
-    dwell_ = bad ? (dwell_ + dt) : 0.0f;
-    return dwell_ > cfg::kCurrentPlausDwellS;
-  }
-  void reset() { dwell_ = 0.0f; }
-
- private:
-  float dwell_ = 0.0f;
-};
 
 struct LoopState {
   core::AttitudeEstimator estimator;

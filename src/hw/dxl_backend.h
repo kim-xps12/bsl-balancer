@@ -9,6 +9,7 @@
 #include <cstdint>
 
 #include "../app_config.h"
+#include "../core/watchdog_policy.h"
 
 namespace hw {
 
@@ -107,9 +108,10 @@ class DxlBackend {
   uint8_t health_phase_ = 0;
   HealthInfo health_{};
   uint32_t tx_fail_count_ = 0;
-  // Watchdog 自動復旧の頻度制限 (§4.3: 60s 内 3 回で FAULT)
-  int recover_count_ = 0;
-  float recover_window_start_s_ = 0.0f;
+  // Watchdog 自動復旧の頻度制限 (§4.3: 60s 内 3 回で FAULT)。判断は
+  // core::WatchdogRecoverLimiter へ抽出済み (段階1b。
+  // docs/plans/2026-07-06-safety-core-extraction.md §3.2)。
+  core::WatchdogRecoverLimiter limiter_;
 };
 
 }  // namespace hw

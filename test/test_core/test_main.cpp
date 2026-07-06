@@ -6,10 +6,14 @@
 
 #include "../../src/core/attitude_estimator.h"
 #include "../../src/core/balance_core.h"
+#include "../../src/core/dt_stats.h"
+#include "../../src/core/dxl_verify.h"
 #include "../../src/core/param_validation.h"
 #include "../../src/core/pid.h"
+#include "../../src/core/plausibility_monitor.h"
 #include "../../src/core/safety_fsm.h"
 #include "../../src/core/units.h"
+#include "../../src/core/watchdog_policy.h"
 
 #include <unity.h>
 
@@ -624,6 +628,448 @@ static void test_commissioning_fail_closed() {
   TEST_ASSERT_FALSE(validateCommissioning(rec, csum, 3));
 }
 
+// ---------------- dxl_verify (§4.2 配達証明。段階1a抽出) ----------------
+
+static DxlStatusView writeOkView(uint8_t id) {
+  DxlStatusView st;
+  st.ok = true;
+  st.id = id;
+  st.err_idx = 0;
+  st.recv_param_len = 0;
+  return st;
+}
+
+static void test_dxl_verify_write_accept_and_reject() {
+  // 受理: ID 一致・err=0・param_len=0
+  TEST_ASSERT_TRUE(isWriteStatusVerified(writeOkView(3), 3));
+
+  // 拒否1: st.ok=false (= rx nullptr の view。他フィールドは既定値のまま)
+  DxlStatusView st_no_rx;
+  TEST_ASSERT_FALSE(isWriteStatusVerified(st_no_rx, 3));
+
+  // 拒否2: ID 不一致
+  {
+    DxlStatusView st = writeOkView(3);
+    st.id = 4;
+    TEST_ASSERT_FALSE(isWriteStatusVerified(st, 3));
+  }
+  // 拒否3: err_idx=0x80 (ALERT も含め非零は拒否)
+  {
+    DxlStatusView st = writeOkView(3);
+    st.err_idx = 0x80;
+    TEST_ASSERT_FALSE(isWriteStatusVerified(st, 3));
+  }
+  // 拒否4: err_idx=0x01 (Result Fail 等)
+  {
+    DxlStatusView st = writeOkView(3);
+    st.err_idx = 0x01;
+    TEST_ASSERT_FALSE(isWriteStatusVerified(st, 3));
+  }
+  // 拒否5: recv_param_len != 0 (前回 READ の遅延応答の誤受理拒否)
+  {
+    DxlStatusView st = writeOkView(3);
+    st.recv_param_len = 2;
+    TEST_ASSERT_FALSE(isWriteStatusVerified(st, 3));
+  }
+
+  // 述語の限界の明示 (§8 残余リスク): 同一 ID・err=0・param_len=0 の遅延
+  // WRITE Status は述語単体では判別不能で受理される (現行実装と同一の挙動。
+  // drainRx は tx 前の残留バイトのみ除去し、tx 後に到着する遅延応答は防げ
+  // ない)。段階5 の transport タイムラインテストでクローズするまでの残余
+  // リスクとしてここに明示する — writeOkView(3) は「本来の Status」と
+  // 「同一 ID の遅延応答」を型として区別できないため、両者とも受理される。
+  TEST_ASSERT_TRUE(isWriteStatusVerified(writeOkView(3), 3));
+}
+
+static DxlStatusView readOkView(uint8_t id, uint16_t len, uint8_t err_idx = 0) {
+  DxlStatusView st;
+  st.ok = true;
+  st.id = id;
+  st.err_idx = err_idx;
+  st.recv_param_len = len;
+  return st;
+}
+
+static void test_dxl_verify_read_accept_and_reject() {
+  // 受理: err=0
+  TEST_ASSERT_TRUE(isReadStatusVerified(readOkView(5, 2), 5, 2));
+  // 受理: ALERT のみ (0x80) は現行仕様どおりデータ有効
+  TEST_ASSERT_TRUE(isReadStatusVerified(readOkView(5, 2, 0x80), 5, 2));
+
+  // 拒否1: rx 失敗 (st.ok=false)
+  {
+    DxlStatusView st;
+    TEST_ASSERT_FALSE(isReadStatusVerified(st, 5, 2));
+  }
+  // 拒否2: ID 不一致
+  {
+    DxlStatusView st = readOkView(5, 2);
+    st.id = 6;
+    TEST_ASSERT_FALSE(isReadStatusVerified(st, 5, 2));
+  }
+  // 拒否3: 長さ不一致
+  TEST_ASSERT_FALSE(isReadStatusVerified(readOkView(5, 1), 5, 2));
+  // 拒否4: Result Fail (err & 0x7F != 0)。ALERT と重畳した 0x81 も拒否
+  TEST_ASSERT_FALSE(isReadStatusVerified(readOkView(5, 2, 0x01), 5, 2));
+  TEST_ASSERT_FALSE(isReadStatusVerified(readOkView(5, 2, 0x81), 5, 2));
+}
+
+// ---------------- watchdog_policy (§4.3 遷移表。段階1b抽出) ----------------
+
+static constexpr uint8_t kTestTripped = 0xFF;
+
+static void test_watchdog_raw_read_failure_confirms_immediately() {
+  // rawL 読取失敗: 1 回目の feedRaw で即確定 (rawR を feed しない)
+  {
+    WatchdogDecision d(/*torque_may_be_on=*/true, kTestTripped);
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Fault),
+                       static_cast<int>(d.feedRaw(false, 0)));
+  }
+  {
+    WatchdogDecision d(/*torque_may_be_on=*/false, kTestTripped);
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Ok),
+                       static_cast<int>(d.feedRaw(false, 0)));
+  }
+  // rawR 読取失敗: 2 回目で即確定 (1 回目は非トリップの正常読取)
+  {
+    WatchdogDecision d(/*torque_may_be_on=*/true, kTestTripped);
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Pending),
+                       static_cast<int>(d.feedRaw(true, 0x00)));
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Fault),
+                       static_cast<int>(d.feedRaw(false, 0)));
+  }
+  {
+    WatchdogDecision d(/*torque_may_be_on=*/false, kTestTripped);
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Pending),
+                       static_cast<int>(d.feedRaw(true, 0x00)));
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Ok),
+                       static_cast<int>(d.feedRaw(false, 0)));
+  }
+}
+
+static void test_watchdog_raw_trip_combinations() {
+  // 両輪非トリップ → 2 回目の feedRaw で Ok
+  {
+    WatchdogDecision d(true, kTestTripped);
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Pending),
+                       static_cast<int>(d.feedRaw(true, 0x00)));
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Ok),
+                       static_cast<int>(d.feedRaw(true, 0x00)));
+  }
+  // トリップ L のみ → 2 回目の feedRaw で Pending (TE 段階へ)
+  {
+    WatchdogDecision d(true, kTestTripped);
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Pending),
+                       static_cast<int>(d.feedRaw(true, kTestTripped)));
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Pending),
+                       static_cast<int>(d.feedRaw(true, 0x00)));
+  }
+  // トリップ R のみ
+  {
+    WatchdogDecision d(true, kTestTripped);
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Pending),
+                       static_cast<int>(d.feedRaw(true, 0x00)));
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Pending),
+                       static_cast<int>(d.feedRaw(true, kTestTripped)));
+  }
+  // 両輪トリップ
+  {
+    WatchdogDecision d(true, kTestTripped);
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Pending),
+                       static_cast<int>(d.feedRaw(true, kTestTripped)));
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Pending),
+                       static_cast<int>(d.feedRaw(true, kTestTripped)));
+  }
+}
+
+static void test_watchdog_te_read_failure_confirms_immediately() {
+  // teL 読取失敗: 1 回目の feedTe で即 Fault (teR を feed しない)
+  {
+    WatchdogDecision d(true, kTestTripped);
+    d.feedRaw(true, kTestTripped);
+    d.feedRaw(true, 0x00);  // トリップ確定 → Pending (TE 段階へ)
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Fault),
+                       static_cast<int>(d.feedTe(false, 0)));
+  }
+  // teR 読取失敗: 2 回目で Fault (1 回目は正常読取)
+  {
+    WatchdogDecision d(true, kTestTripped);
+    d.feedRaw(true, kTestTripped);
+    d.feedRaw(true, 0x00);
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Pending),
+                       static_cast<int>(d.feedTe(true, 0)));
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Fault),
+                       static_cast<int>(d.feedTe(false, 0)));
+  }
+}
+
+static void test_watchdog_te_value_combinations() {
+  // (teL,teR) 全組合せ (ゲート1第3回指摘対応: 現行 te[0]!=0||te[1]!=0 の OR
+  // 意味論が && へ写し間違えられても検出できるよう全組合せを固定)。
+  // 2 回目の feedTe 完了時に確定 (1 回目は teL 非零でも Pending = teL 非零
+  // でも teR 読取まで行う現行 I/O 順序契約を同じテストで固定)。
+  struct Case { uint8_t te_l, te_r; WatchdogVerdict expect; };
+  const Case cases[] = {
+      {1, 0, WatchdogVerdict::Fault},
+      {0, 1, WatchdogVerdict::Fault},
+      {1, 1, WatchdogVerdict::Fault},
+      {0, 0, WatchdogVerdict::ProceedRecover},
+  };
+  for (const auto& c : cases) {
+    WatchdogDecision d(true, kTestTripped);
+    d.feedRaw(true, kTestTripped);
+    d.feedRaw(true, 0x00);  // トリップ確定 → Pending
+    const WatchdogVerdict v1 = d.feedTe(true, c.te_l);
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Pending),
+                       static_cast<int>(v1));  // 1 回目は常に Pending
+    const WatchdogVerdict v2 = d.feedTe(true, c.te_r);
+    TEST_ASSERT_EQUAL(static_cast<int>(c.expect), static_cast<int>(v2));
+  }
+}
+
+static void test_watchdog_characterization_trip_then_raw_read_failure() {
+  // 現行挙動の特性化 (§3.2 潜在エッジ・§8 残余リスク): rawL=0xFF (トリップ)
+  // を観測した直後に rawR の読取が失敗すると、先行トリップ証拠は結果に
+  // 影響せず torque_may_be_on の値のみで確定する (false→Ok / true→Fault)。
+  // これは現行 dxl_backend.cpp:374-378 と同一の残余リスクであり、
+  // fail-closed 化 (トリップ証拠観測後の読取失敗を Fault 化) は別課題として
+  // ユーザへエスカレーション済み (安全挙動変更のためユーザ判断が必要)。
+  {
+    WatchdogDecision d(/*torque_may_be_on=*/false, kTestTripped);
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Pending),
+                       static_cast<int>(d.feedRaw(true, kTestTripped)));
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Ok),
+                       static_cast<int>(d.feedRaw(false, 0)));
+  }
+  {
+    WatchdogDecision d(/*torque_may_be_on=*/true, kTestTripped);
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Pending),
+                       static_cast<int>(d.feedRaw(true, kTestTripped)));
+    TEST_ASSERT_EQUAL(static_cast<int>(WatchdogVerdict::Fault),
+                       static_cast<int>(d.feedRaw(false, 0)));
+  }
+}
+
+static void test_watchdog_recover_limiter_window_and_deny() {
+  const float window_s = 60.0f;
+  const int max_count = 3;
+
+  // 窓内 2 回目まで allow・3 回目 deny・deny 後も窓内は deny 継続
+  {
+    WatchdogRecoverLimiter lim;
+    TEST_ASSERT_TRUE(lim.allow(0.0f, window_s, max_count));
+    TEST_ASSERT_TRUE(lim.allow(10.0f, window_s, max_count));
+    TEST_ASSERT_FALSE(lim.allow(20.0f, window_s, max_count));
+    TEST_ASSERT_FALSE(lim.allow(30.0f, window_s, max_count));  // deny 継続
+  }
+
+  // 境界: ちょうど window_s は同一窓 (> 比較なので == はリセットしない)
+  {
+    WatchdogRecoverLimiter lim;
+    TEST_ASSERT_TRUE(lim.allow(0.0f, window_s, max_count));       // count=1
+    TEST_ASSERT_TRUE(lim.allow(window_s, window_s, max_count));   // count=2 (同一窓)
+    TEST_ASSERT_FALSE(lim.allow(window_s, window_s, max_count));  // count=3 → deny
+  }
+
+  // 境界: window_s+ε で新窓 (リセット)
+  {
+    WatchdogRecoverLimiter lim;
+    TEST_ASSERT_TRUE(lim.allow(0.0f, window_s, max_count));               // count=1
+    TEST_ASSERT_TRUE(lim.allow(window_s * 0.5f, window_s, max_count));    // count=2
+    TEST_ASSERT_FALSE(lim.allow(window_s * 0.9f, window_s, max_count));   // count=3 → deny (同一窓)
+    TEST_ASSERT_TRUE(lim.allow(window_s + 0.001f, window_s, max_count));  // 新窓 → count=1 → allow
+  }
+}
+
+// ---------------- plausibility_monitor (§6。段階2逐語移動) ----------------
+
+static void test_plausibility_fb_invalid_no_judge() {
+  PlausibilityMonitor pm;
+  // fb_valid=false: 判定しない・dwell 非蓄積
+  for (int i = 0; i < 100; ++i) {
+    TEST_ASSERT_FALSE(pm.update(/*torque_on=*/true, /*fb_valid=*/false, 0.0f, 1.0f, 0.005f));
+  }
+}
+
+static void test_plausibility_torque_on_dwell_threshold() {
+  PlausibilityMonitor pm;
+  const float dt = cfg::kCurrentPlausDwellS;  // 1 周期でちょうど閾値相当の dt
+  // err = |1.0-0.5| = 0.5 > kCurrentMismatchA(0.3) なので bad
+  // 1 回目: dwell = 0+dt == 閾値 (ちょうど、ビット同一) → > 比較で false (境界)
+  TEST_ASSERT_FALSE(pm.update(true, true, 0.5f, 1.0f, dt));
+  // 2 回目: dwell = 2*閾値 > 閾値 → true
+  TEST_ASSERT_TRUE(pm.update(true, true, 0.5f, 1.0f, dt));
+}
+
+static void test_plausibility_recovery_resets_dwell() {
+  PlausibilityMonitor pm;
+  const float dt = cfg::kCurrentPlausDwellS;
+  TEST_ASSERT_FALSE(pm.update(true, true, 0.5f, 1.0f, dt));  // dwell=閾値 (bad)
+  // 正常に戻る (err=0) → dwell リセット
+  TEST_ASSERT_FALSE(pm.update(true, true, 1.0f, 1.0f, dt));
+  // 良好状態直後にもう一度悪化させても、まだ 1 周期分の dwell しか無い
+  TEST_ASSERT_FALSE(pm.update(true, true, 0.5f, 1.0f, dt));
+}
+
+static void test_plausibility_torque_off_residual_and_reset() {
+  PlausibilityMonitor pm;
+  const float dt = cfg::kCurrentPlausDwellS;
+  // torque_off: |i_pres| > kCurrentResidualA(0.1) で bad
+  TEST_ASSERT_FALSE(pm.update(false, true, 0.0f, 0.2f, dt));  // dwell=閾値ちょうど
+  TEST_ASSERT_TRUE(pm.update(false, true, 0.0f, 0.2f, dt));   // 超過
+  pm.reset();
+  // reset 後は dwell 0 から再スタート。残留電流が閾値内なら bad にならない
+  TEST_ASSERT_FALSE(pm.update(false, true, 0.0f, 0.05f, dt));
+}
+
+// ---------------- dt_stats (§6 soak gate 計算コア。段階3新設) ----------------
+
+static void test_dtstats_p95_n0_fails_closed() {
+  DtP95Window w;
+  float v = 12.34f;  // 番兵値
+  TEST_ASSERT_FALSE(w.p95(&v));
+  TEST_ASSERT_FLOAT_WITHIN(1e-9f, 12.34f, v);  // *out 不変
+}
+
+static void test_dtstats_n1() {
+  DtP95Window w;
+  w.add(0.005f);
+  float v = -1.0f;
+  TEST_ASSERT_TRUE(w.p95(&v));
+  TEST_ASSERT_FLOAT_WITHIN(1e-9f, 0.005f, v);
+}
+
+static void test_dtstats_n20_known_distribution() {
+  DtP95Window w;
+  // 値 1..20 を投入。nearest-rank: idx = ceil(0.95*20)-1 = 18 (0-indexed)
+  // = 昇順 19 番目の値 = 19
+  for (int i = 1; i <= 20; ++i) w.add(static_cast<float>(i));
+  float v = 0.0f;
+  TEST_ASSERT_TRUE(w.p95(&v));
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, 19.0f, v);
+}
+
+static void test_dtstats_unsorted_and_duplicate_input() {
+  DtP95Window w;
+  // {1..20} の多重集合だが 17 を欠落させ 19 を重複させた (合計 20 個)。
+  // ソート後: 1,2,...,16,18,19,19,20 → idx=18 (0-indexed) = 19
+  const float vals[] = {5, 1, 20, 3, 19, 19, 2, 18, 4, 6,
+                        7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+  for (float x : vals) w.add(x);
+  float v = 0.0f;
+  TEST_ASSERT_TRUE(w.p95(&v));
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, 19.0f, v);
+}
+
+static void test_dtstats_p95_preserves_input_order() {
+  DtP95Window w;
+  w.add(3.0f);
+  w.add(1.0f);
+  w.add(2.0f);
+  float v1 = 0.0f, v2 = 0.0f;
+  TEST_ASSERT_TRUE(w.p95(&v1));
+  // 同一呼出しを繰り返しても同じ値 (内部作業配列で選択・buf_ は非破壊)
+  TEST_ASSERT_TRUE(w.p95(&v2));
+  TEST_ASSERT_FLOAT_WITHIN(1e-9f, v1, v2);
+  // 呼出し後も add を継続でき、新規サンプルを含めた計算が正しく行われる
+  w.add(0.5f);
+  TEST_ASSERT_EQUAL(4, static_cast<int>(w.size()));
+  float v3 = 0.0f;
+  TEST_ASSERT_TRUE(w.p95(&v3));
+  // n=4: idx = ceil(0.95*4)-1 = ceil(3.8)-1 = 4-1 = 3 → 最大値 (3.0)
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, 3.0f, v3);
+}
+
+static void test_dtstats_n400_soak_window() {
+  DtP95Window w;
+  for (int i = 0; i < 400; ++i) w.add(0.005f);  // 200Hz×2s の均一 dt
+  TEST_ASSERT_EQUAL(400, static_cast<int>(w.size()));
+  TEST_ASSERT_FALSE(w.overflowed());
+  TEST_ASSERT_TRUE(w.ready(400));
+  float v = 0.0f;
+  TEST_ASSERT_TRUE(w.p95(&v));
+  TEST_ASSERT_FLOAT_WITHIN(1e-9f, 0.005f, v);
+}
+
+static void test_dtstats_ready_boundary() {
+  DtP95Window w399;
+  for (int i = 0; i < 399; ++i) w399.add(0.001f);
+  TEST_ASSERT_FALSE(w399.ready(400));
+
+  DtP95Window w400;
+  for (int i = 0; i < 400; ++i) w400.add(0.001f);
+  TEST_ASSERT_TRUE(w400.ready(400));
+}
+
+static void test_dtstats_capacity_overflow_keeps_existing_samples() {
+  DtP95Window w;
+  for (size_t i = 0; i < DtP95Window::kCapacity; ++i) w.add(0.005f);  // ちょうど満杯
+  TEST_ASSERT_EQUAL(static_cast<int>(DtP95Window::kCapacity), static_cast<int>(w.size()));
+  TEST_ASSERT_FALSE(w.overflowed());
+
+  // 満杯後の追加は記録されず overflowed が立つ (既存サンプルは変化しない)
+  w.add(0.999f);
+  TEST_ASSERT_EQUAL(static_cast<int>(DtP95Window::kCapacity), static_cast<int>(w.size()));
+  TEST_ASSERT_TRUE(w.overflowed());
+  float v = 0.0f;
+  TEST_ASSERT_TRUE(w.p95(&v));
+  TEST_ASSERT_FLOAT_WITHIN(1e-9f, 0.005f, v);  // 0.999 は含まれない
+  TEST_ASSERT_FALSE(w.ready(1));  // overflow → ready は常に false
+}
+
+static void test_dtstats_reset() {
+  DtP95Window w;
+  w.add(1.0f);
+  w.add(2.0f);
+  w.reset();
+  TEST_ASSERT_EQUAL(0, static_cast<int>(w.size()));
+  TEST_ASSERT_FALSE(w.overflowed());
+  float v = 0.0f;
+  TEST_ASSERT_FALSE(w.p95(&v));  // n==0 → false・*out 不変
+  TEST_ASSERT_FLOAT_WITHIN(1e-9f, 0.0f, v);
+  w.add(3.0f);
+  TEST_ASSERT_EQUAL(1, static_cast<int>(w.size()));
+}
+
+static void test_dtstats_fail_closed_gate_table() {
+  // 「ready && p95 && v<=budget」合成ゲートが空窓・不足窓・溢れ窓で合格し
+  // 得ないことのテーブルテスト。
+  const float budget = 0.010f;
+
+  // 空窓
+  {
+    DtP95Window w;
+    float v = 0.0f;
+    const bool gate = w.ready(400) && w.p95(&v) && v <= budget;
+    TEST_ASSERT_FALSE(gate);
+  }
+  // 不足窓 (n=399 < min_samples=400)
+  {
+    DtP95Window w;
+    for (int i = 0; i < 399; ++i) w.add(0.001f);
+    float v = 0.0f;
+    const bool gate = w.ready(400) && w.p95(&v) && v <= budget;
+    TEST_ASSERT_FALSE(gate);
+  }
+  // ちょうど 400 (予算内) → 合格
+  {
+    DtP95Window w;
+    for (int i = 0; i < 400; ++i) w.add(0.001f);
+    float v = 0.0f;
+    const bool gate = w.ready(400) && w.p95(&v) && v <= budget;
+    TEST_ASSERT_TRUE(gate);
+  }
+  // 溢れ窓 (overflow) → ready は常に false
+  {
+    DtP95Window w;
+    for (size_t i = 0; i < DtP95Window::kCapacity; ++i) w.add(0.001f);
+    w.add(0.001f);  // 溢れ
+    float v = 0.0f;
+    const bool gate = w.ready(1) && w.p95(&v) && v <= budget;
+    TEST_ASSERT_FALSE(gate);
+  }
+}
+
 // ---------------- runner ----------------
 
 int main(int, char**) {
@@ -660,5 +1106,27 @@ int main(int, char**) {
   RUN_TEST(test_params_defaults_valid);
   RUN_TEST(test_commissioning_fail_closed);
   RUN_TEST(test_fsm_entry_failed);
+  RUN_TEST(test_dxl_verify_write_accept_and_reject);
+  RUN_TEST(test_dxl_verify_read_accept_and_reject);
+  RUN_TEST(test_watchdog_raw_read_failure_confirms_immediately);
+  RUN_TEST(test_watchdog_raw_trip_combinations);
+  RUN_TEST(test_watchdog_te_read_failure_confirms_immediately);
+  RUN_TEST(test_watchdog_te_value_combinations);
+  RUN_TEST(test_watchdog_characterization_trip_then_raw_read_failure);
+  RUN_TEST(test_watchdog_recover_limiter_window_and_deny);
+  RUN_TEST(test_plausibility_fb_invalid_no_judge);
+  RUN_TEST(test_plausibility_torque_on_dwell_threshold);
+  RUN_TEST(test_plausibility_recovery_resets_dwell);
+  RUN_TEST(test_plausibility_torque_off_residual_and_reset);
+  RUN_TEST(test_dtstats_p95_n0_fails_closed);
+  RUN_TEST(test_dtstats_n1);
+  RUN_TEST(test_dtstats_n20_known_distribution);
+  RUN_TEST(test_dtstats_unsorted_and_duplicate_input);
+  RUN_TEST(test_dtstats_p95_preserves_input_order);
+  RUN_TEST(test_dtstats_n400_soak_window);
+  RUN_TEST(test_dtstats_ready_boundary);
+  RUN_TEST(test_dtstats_capacity_overflow_keeps_existing_samples);
+  RUN_TEST(test_dtstats_reset);
+  RUN_TEST(test_dtstats_fail_closed_gate_table);
   return UNITY_END();
 }
