@@ -16,8 +16,6 @@ struct Snapshot {
   // 状態
   uint8_t fsm_state = 0;        // core::FsmState
   uint8_t fault_reason = 0;     // core::FaultReason
-  bool commissioned = false;
-  uint8_t profile = 0;          // cfg::Profile
   // 制御量 (SI)
   float theta = 0.0f;           // 0 中心 [rad]
   float theta_rate = 0.0f;      // [rad/s]
@@ -29,6 +27,7 @@ struct Snapshot {
   float i_cmd_right = 0.0f;
   float i_present_left = 0.0f;
   float i_present_right = 0.0f;
+  bool wheel_valid = false;     // DXL 帰還の有効性 (起立検出の必要条件)
   // タイミング
   float dt_last = 0.0f;         // [s]
   float dt_max = 0.0f;
@@ -51,7 +50,7 @@ struct ParamCommand {
   float value;
 };
 
-enum class SaveKind : uint8_t { None = 0, Params, Commission };
+enum class SaveKind : uint8_t { None = 0, Params };
 
 class SharedState {
  public:

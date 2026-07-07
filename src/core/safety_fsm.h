@@ -50,8 +50,6 @@ class SafetyFsm {
     float fall_threshold_rad = 0.611f;
     int fall_escalation_count = 3;
     float fall_escalation_window_s = 30.0f;
-    bool auto_arm = true;      // コミッショニング済みの場合のみ有効
-    bool commissioned = false; // 未コミッショニングなら明示アーム必須
   };
 
   struct Input {
@@ -78,10 +76,10 @@ class SafetyFsm {
   FaultReason faultReason() const { return fault_reason_; }
   int fallCount() const { return fall_count_; }
 
-  // INITIALIZING 完了 (自己検査含む) の報告。auto-arm ゲート (§6) を適用。
+  // INITIALIZING 完了 (自己検査含む) の報告。
   void notifyInitDone() {
     if (state_ != FsmState::Initializing) return;
-    state_ = (p_.commissioned && p_.auto_arm) ? FsmState::Idle : FsmState::Disarmed;
+    state_ = FsmState::Idle;
   }
 
   // enter_balancing() の実行結果報告
@@ -173,7 +171,7 @@ class SafetyFsm {
 
       case FsmState::Disarmed: {
         if (in.stop_toggle) {
-          // 明示アーム (BtnC): コミッショニング前でも許可 (ブリングアップ経路)
+          // 明示アーム (BtnC)
           if (!in.save_in_progress) {
             state_ = FsmState::Idle;
             upright_since_valid_ = false;
@@ -198,9 +196,13 @@ class SafetyFsm {
   static float fabsf_(float v) { return v < 0.0f ? -v : v; }
 
   bool uprightHold(const Input& in) {
+    // 読取欠落周期は「情報なし」としてタイマを維持する (実バスは数%の率で
+    // 単発の読取落ちがあり、リセットすると保持時間の連続成立がほぼ不可能)。
+    // 帰還が死んだままなら DxlReadStale が先に FAULT させるため安全側は保たれる
+    if (!in.wheel_valid) return false;
     const bool ok = fabsf_(in.theta) < p_.start_window_rad &&
                     fabsf_(in.theta_rate) < p_.start_rate_max &&
-                    in.wheel_valid && in.wheel_speed_max < p_.start_wheel_max;
+                    in.wheel_speed_max < p_.start_wheel_max;
     if (!ok) {
       upright_since_valid_ = false;
       return false;
