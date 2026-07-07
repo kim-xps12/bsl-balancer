@@ -49,8 +49,9 @@ constexpr uint32_t kDxlIoTimeoutMs        = 2;   // 全トランザクション�
 constexpr float    kDxlCycleBudgetS       = 0.003f; // 1周期内 DXL 総予算 3ms
 constexpr int      kDxlReadStaleFaultCycles = 40; // 読取失敗 連続 200ms で FAULT
 // (実バスは読取が単発で落ちる。失敗周期はコースト(§4.2)なので 200ms まで許容)
-constexpr float    kUnverifiedTorqueMaxS  = 0.050f; // 未検証トルク窓 (壁時計)
-// (実測バーストは>15ms。窓内は毎周期の検証付き零書込で回復を試み続け、
+constexpr float    kUnverifiedTorqueMaxS  = 0.150f; // 未検証トルク窓 (壁時計)
+// (実測バーストは50msでも不足する場合がある: 3分連続倒立の末に50ms超の
+//  バス断でラッチした実績。窓内は毎周期の検証付き零書込で回復を試み続け、
 //  バス完全断は XL330 の Bus Watchdog(20ms) が自律的にトルク遮断する)
 constexpr uint8_t  kBusWatchdogRaw        = 1;   // 20ms (raw 1 = 最小)
 constexpr float    kBusWatchdogWindowS    = 0.020f;
