@@ -76,9 +76,10 @@ constexpr float kWheelSpeedSoftRadS = 25.0f; // TUNE
 constexpr float kWheelSpeedHardRadS = 35.0f; // 超過で FAULT TUNE
 
 // ---- 制御ゲイン初期値 (§2.2 TUNE) ----
-constexpr float kPitchKp        = 1.5f;    // [A/rad]
+constexpr float kPitchKp        = 3.0f;    // [A/rad] 実機テレメトリ較正: 1.5では
+// 3.2Hz/±7.5°のリミットサイクル (i_cmd_sd 0.09A と過小authority) → 2倍へ
 constexpr float kPitchKi        = 0.0f;    // [A/(rad*s)] Bala2 実績に従い 0
-constexpr float kPitchKd        = 0.08f;   // [A/(rad/s)]
+constexpr float kPitchKd        = 0.15f;   // [A/(rad/s)] Kp 比を概ね維持して増加
 constexpr float kPitchILimitA   = 0.15f;   // 積分項クランプ [A]
 constexpr float kDTermLpfHz     = 25.0f;   // D 項 PT1 カットオフ
 constexpr float kVelKv          = 0.10f;   // [rad/(m/s)]
