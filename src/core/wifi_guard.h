@@ -34,21 +34,45 @@ class FreshnessTracker {
   bool observe(bool read_ok, uint32_t loop_count) {
     if (!read_ok) {
       have_baseline_ = false;
+      advance_seen_ = false;
+      stall_ticks_ = 0;
       return false;
     }
     if (!have_baseline_) {
       have_baseline_ = true;
+      advance_seen_ = false;
       last_loop_count_ = loop_count;
+      stall_ticks_ = 0;
       return false;  // 初回観測は「前進」を証明できないため fresh 扱いしない
     }
     const bool advanced = (loop_count != last_loop_count_);
     last_loop_count_ = loop_count;
-    return advanced;
+    if (advanced) {
+      advance_seen_ = true;
+      stall_ticks_ = 0;
+      return true;
+    }
+    // 前進実績なし (未 publish の既定バッファ等) の不前進は即 stale (耐性対象外)
+    if (!advance_seen_) return false;
+    // 一時停滞の耐性 (実機ベンチで確定した実測バグの修正): WiFi.begin() は
+    // core0 の WiFi ドライバタスク (優先度23 > 制御20) を起動し、制御ループを
+    // 最大 ~70ms 停止させる。1 tick (50ms) の不前進で即 stale 扱いすると、
+    // ガードが自らの接続試行由来の停滞を「制御異常」(WIFI_QUIET) と誤認して
+    // connecting_ を abort し、未 association の abort は確認イベントが来ない
+    // ためリトライ枯渇 → WIFI_OFF 永久ラッチに一直線となる。4 tick (200ms)
+    // 連続不前進までは fresh 判定を維持する。制御の恒久停止は
+    // DxlReadStale/LoopOverrun の FAULT ラッチが別途担い、Balancing 中の
+    // WIFI_QUIET は balancing フラグ直結のため本耐性の影響を受けない。
+    ++stall_ticks_;
+    return stall_ticks_ <= kStallToleranceTicks;
   }
 
  private:
+  static constexpr uint32_t kStallToleranceTicks = 4;
   bool have_baseline_ = false;
+  bool advance_seen_ = false;
   uint32_t last_loop_count_ = 0;
+  uint32_t stall_ticks_ = 0;
 };
 
 // 単一の禁止述語 WIFI_QUIET (計画書 §3.1)。以降のすべての規則はこれを参照する。

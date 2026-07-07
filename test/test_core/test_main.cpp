@@ -817,15 +817,21 @@ static void test_wifi_quiet_five_cases() {
     TEST_ASSERT_FALSE(f2);
     TEST_ASSERT_TRUE(wifiQuiet(f2, false, false));
   }
-  // (2) stale-loop: 前進後に停滞
+  // (2) stale-loop: 前進後に停滞。WiFi.begin() 由来の一時停滞 (実測 ~70ms) を
+  // 誤検知しないよう 4 tick (200ms) までは fresh を維持し、5 tick 目で stale
   {
     FreshnessTracker ft;
     ft.observe(true, 10);
     const bool f1 = ft.observe(true, 11);
     TEST_ASSERT_TRUE(f1);
+    for (int i = 0; i < 4; ++i) {
+      TEST_ASSERT_TRUE(ft.observe(true, 11));  // 耐性窓内
+    }
     const bool f2 = ft.observe(true, 11);
     TEST_ASSERT_FALSE(f2);
     TEST_ASSERT_TRUE(wifiQuiet(f2, false, false));
+    // 前進が再開したら即 fresh 復帰
+    TEST_ASSERT_TRUE(ft.observe(true, 12));
   }
   // (3) read-fail
   {

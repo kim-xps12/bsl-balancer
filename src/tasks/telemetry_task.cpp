@@ -146,6 +146,16 @@ int TraceOpsBeginPacket(void* ctx) {
 // Wi-Fi API はここでは一切呼ばない)。
 void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   if (!g_guard) return;
+#if !BSL_WIFI_GUARD_TRACE
+  // ベンチデバッグ: 切断理由コードの可視化 (2=AUTH_EXPIRE, 15=4WAY_TIMEOUT=
+  // パスワード誤り, 201=NO_AP_FOUND=SSID不在/2.4GHz非対応 等)
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    Serial.printf("[WF] disconnected reason=%d\n",
+                  static_cast<int>(info.wifi_sta_disconnected.reason));
+  } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    Serial.println("[WF] got IP");
+  }
+#endif
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
       g_guard->pushEvent(core::WifiGuard::EventKind::GotIp);
@@ -276,6 +286,20 @@ void telemetryTaskEntry(void*) {
     shared::Snapshot snap;
     const bool read_ok = g_shared->read(&snap);
     if (!read_ok) ++read_fail_total;  // 実装上は常に true (§3.1 防御的カウンタ)
+
+#if !BSL_WIFI_GUARD_TRACE
+    // 1Hz Wi-Fi 状態シリアル出力 (ベンチデバッグ用。trace ビルドでは Serial を
+    // バイナリトレースが占有するため出さない)
+    if ((tick % 20u) == 0u) {
+      Serial.printf("[WF] st=%d conn=%d ing=%d udp=%d abort=%d ip=%s rssi=%d seq=%lu\n",
+                    static_cast<int>(WiFi.status()), g_guard->connected() ? 1 : 0,
+                    g_guard->connecting() ? 1 : 0, g_guard->udpReady() ? 1 : 0,
+                    g_guard->wifiAbortFailed() ? 1 : 0,
+                    WiFi.localIP().toString().c_str(),
+                    static_cast<int>(WiFi.RSSI()),
+                    static_cast<unsigned long>(seq));
+    }
+#endif
 
     const bool balancing =
         read_ok && snap.fsm_state == static_cast<uint8_t>(core::FsmState::Balancing);
