@@ -383,7 +383,7 @@ static void test_balance_stale_freezes_outer_loop() {
 
 // ---------------- FSM (§6) ----------------
 
-static SafetyFsm::Params fsmParams(bool commissioned = true, bool auto_arm = true) {
+static SafetyFsm::Params fsmParams() {
   SafetyFsm::Params p;
   p.start_window_rad = 0.0873f;
   p.start_rate_max = 0.35f;
@@ -392,8 +392,6 @@ static SafetyFsm::Params fsmParams(bool commissioned = true, bool auto_arm = tru
   p.fall_threshold_rad = 0.611f;
   p.fall_escalation_count = 3;
   p.fall_escalation_window_s = 30.0f;
-  p.auto_arm = auto_arm;
-  p.commissioned = commissioned;
   return p;
 }
 
@@ -421,15 +419,11 @@ static bool driveUntilArm(SafetyFsm& fsm, float* now_s, float duration_s) {
 }
 
 static void test_fsm_boot_gate() {
+  // notifyInitDone() は常に Idle へ (自動アーム。コミッショニング機構は廃止)
   SafetyFsm fsm;
-  fsm.setParams(fsmParams(true, true));
+  fsm.setParams(fsmParams());
   fsm.notifyInitDone();
   TEST_ASSERT_EQUAL(static_cast<int>(FsmState::Idle), static_cast<int>(fsm.state()));
-
-  SafetyFsm fsm2;
-  fsm2.setParams(fsmParams(false, true));  // 未コミッショニング → 明示アーム必須
-  fsm2.notifyInitDone();
-  TEST_ASSERT_EQUAL(static_cast<int>(FsmState::Disarmed), static_cast<int>(fsm2.state()));
 }
 
 static void test_fsm_arm_sequence() {
@@ -658,46 +652,11 @@ static void test_params_reject_invalid() {
   TEST_ASSERT_FALSE(validateParams(rec));
 }
 
-static void test_commissioning_fail_closed() {
-  const uint32_t csum = currentSignAxisChecksum();
-  CommissioningRecord rec;
-  rec.schema_version = cfg::kCommissionSchemaVersion;
-  rec.profile = static_cast<uint8_t>(cfg::Profile::Normal);
-  rec.sign_axis_checksum = csum;
-  rec.calib_version = 3;
-  rec.user_confirmed = true;
-  TEST_ASSERT_TRUE(validateCommissioning(rec, csum, 3));
-
-  // 車輪符号が変わった (チェックサム不一致) → 未コミッショニング扱い
-  const uint32_t csum_wheel = signAxisChecksum(
-      -cfg::kSignLeft, cfg::kSignRight, cfg::kImuAccTiltSign,
-      cfg::kImuAccVertSign, cfg::kImuGyroSign);
-  TEST_ASSERT_FALSE(validateCommissioning(rec, csum_wheel, 3));
-  // IMU 軸符号が変わっても無効化される (gate2 P2 回帰)
-  const uint32_t csum_imu = signAxisChecksum(
-      cfg::kSignLeft, cfg::kSignRight, -cfg::kImuAccTiltSign,
-      cfg::kImuAccVertSign, cfg::kImuGyroSign);
-  TEST_ASSERT_FALSE(validateCommissioning(rec, csum_imu, 3));
-  // 校正版が進んだ
-  TEST_ASSERT_FALSE(validateCommissioning(rec, csum, 4));
-  // 未確認フラグ
-  rec.user_confirmed = false;
-  TEST_ASSERT_FALSE(validateCommissioning(rec, csum, 3));
-  // 旧スキーマ
-  rec.user_confirmed = true;
-  rec.schema_version = 0;
-  TEST_ASSERT_FALSE(validateCommissioning(rec, csum, 3));
-  // Bringup プロファイルの記録では auto-arm 不可
-  rec.schema_version = cfg::kCommissionSchemaVersion;
-  rec.profile = static_cast<uint8_t>(cfg::Profile::Bringup);
-  TEST_ASSERT_FALSE(validateCommissioning(rec, csum, 3));
-}
-
 // ---------------- SafetyFsm::armPending() (UDP telemetry Phase1 計画書 §3.1) ----------------
 
 static void test_fsm_arm_pending_auto_arm() {
   SafetyFsm fsm;
-  fsm.setParams(fsmParams(true, true));  // commissioned + auto_arm → Idle
+  fsm.setParams(fsmParams());  // notifyInitDone() は常に Idle へ (自動アーム)
   fsm.notifyInitDone();
   TEST_ASSERT_EQUAL(static_cast<int>(FsmState::Idle), static_cast<int>(fsm.state()));
   TEST_ASSERT_FALSE(fsm.armPending());  // 起立確認前はまだ保留していない
@@ -721,12 +680,18 @@ static void test_fsm_arm_pending_auto_arm() {
 
 static void test_fsm_arm_pending_manual_arm() {
   SafetyFsm fsm;
-  fsm.setParams(fsmParams(false, true));  // 未コミッショニング → Disarmed 起動
+  fsm.setParams(fsmParams());
   fsm.notifyInitDone();
+  TEST_ASSERT_EQUAL(static_cast<int>(FsmState::Idle), static_cast<int>(fsm.state()));
+
+  float now = 0.0f;
+  // Idle → Disarmed (BtnC 停止) → 再度 BtnC で Idle へ (手動アーム経路の再現)
+  SafetyFsm::Input stop_in = uprightInput(now += 0.005f);
+  stop_in.stop_toggle = true;
+  fsm.update(stop_in);
   TEST_ASSERT_EQUAL(static_cast<int>(FsmState::Disarmed), static_cast<int>(fsm.state()));
   TEST_ASSERT_FALSE(fsm.armPending());
 
-  float now = 0.0f;
   SafetyFsm::Input in = uprightInput(now += 0.005f);
   in.stop_toggle = true;  // BtnC 手動アーム → Idle
   fsm.update(in);
@@ -2020,7 +1985,7 @@ static void test_trace_emitter_tk_ep_predrain_event_after_guard_tick_before_next
 }
 
 // ---------------- 統合: armPending() が Wi-Fi 接続を Balancing 前に abort する ----------------
-// (計画書 §3.1: commissioned auto-arm と BtnC 手動アームの両経路で同一機構であることの確認)
+// (計画書 §3.1: 自動アームと BtnC 手動アームの両経路で同一機構であることの確認)
 
 static void runArmPendingAbortsInFlightConnection(SafetyFsm& fsm, float start_now) {
   TEST_ASSERT_EQUAL(static_cast<int>(FsmState::Idle), static_cast<int>(fsm.state()));
@@ -2065,16 +2030,20 @@ static void runArmPendingAbortsInFlightConnection(SafetyFsm& fsm, float start_no
 
 static void test_integration_wifi_abort_before_balancing_auto_arm() {
   SafetyFsm fsm;
-  fsm.setParams(fsmParams(true, true));
+  fsm.setParams(fsmParams());
   fsm.notifyInitDone();
   runArmPendingAbortsInFlightConnection(fsm, 0.0f);
 }
 
 static void test_integration_wifi_abort_before_balancing_manual_arm() {
   SafetyFsm fsm;
-  fsm.setParams(fsmParams(false, true));  // 未コミッショニング → Disarmed 起動
+  fsm.setParams(fsmParams());
   fsm.notifyInitDone();
   float now = 0.0f;
+  // Idle → Disarmed (BtnC 停止) → 再度 BtnC で Idle へ (手動アーム経路の再現)
+  SafetyFsm::Input stop_in = uprightInput(now += 0.005f);
+  stop_in.stop_toggle = true;
+  fsm.update(stop_in);
   SafetyFsm::Input in = uprightInput(now += 0.005f);
   in.stop_toggle = true;  // BtnC 手動アーム → Idle
   fsm.update(in);
@@ -2167,7 +2136,6 @@ int main(int, char**) {
   RUN_TEST(test_fsm_fault_latch);
   RUN_TEST(test_params_reject_invalid);
   RUN_TEST(test_params_defaults_valid);
-  RUN_TEST(test_commissioning_fail_closed);
   RUN_TEST(test_fsm_entry_failed);
 
   // UDP telemetry Phase1 (計画書 §3.1)

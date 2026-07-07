@@ -17,8 +17,6 @@ struct ControlContext {
   hw::DxlBackend* dxl;
   shared::SharedState* shared;
   core::TuningParams params;   // 起動時ロード済み (検証通過 or 既定値)
-  bool commissioned;
-  cfg::Profile profile;
   bool init_ok;                // main での HW 初期化結果 (false → 即 FAULT)
 };
 

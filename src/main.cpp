@@ -58,29 +58,24 @@ void setup() {
   core::TuningParams params;  // 既定値で初期化済み
   hw::ParamStore::loadParams(&params);
 
-  core::CommissioningRecord comm;
-  bool commissioned = false;
-  if (hw::ParamStore::loadCommissioning(&comm)) {
-    commissioned = core::validateCommissioning(
-        comm, core::currentSignAxisChecksum(), /*current_calib_version=*/1);
-  }
-  const cfg::Profile profile =
-      commissioned ? cfg::Profile::Normal : cfg::Profile::Bringup;
-
   // HW 初期化 (IMU / DXL §4.1)。互いに独立して実行する — IMU が死んでいても
   // DXL 初期化 (前回稼働の残留トルクの解除経路) は必ず走らせる。
   // 失敗時もタスクは起動し FSM が FAULT を表示する。
   const bool imu_ok = imu_backend.init();
   DXL_SERIAL.begin(cfg::kDxlBaud, SERIAL_8N1, cfg::kPinRxServo, cfg::kPinTxServo);
-  const bool dxl_ok = dxl_backend.init(profile);
+  // バースト的なバス不調 (実測) に備えて初期化シーケンス全体も再試行する
+  bool dxl_ok = false;
+  for (int attempt = 0; attempt < 3 && !dxl_ok; ++attempt) {
+    if (attempt > 0) delay(50);
+    dxl_ok = dxl_backend.init();
+  }
   const bool init_ok = imu_ok && dxl_ok;
+  Serial.printf("[BOOT] imu_ok=%d dxl_ok=%d\n", imu_ok, dxl_ok);
 
   control_ctx.imu = &imu_backend;
   control_ctx.dxl = &dxl_backend;
   control_ctx.shared = &shared_state;
   control_ctx.params = params;
-  control_ctx.commissioned = commissioned;
-  control_ctx.profile = profile;
   control_ctx.init_ok = init_ok;
 
   ui_ctx.shared = &shared_state;

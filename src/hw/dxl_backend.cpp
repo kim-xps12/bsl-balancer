@@ -11,6 +11,10 @@ namespace {
 // XL330 制御テーブル (XL330規範 §6.1)
 constexpr uint16_t kAddrModelNumber = 0;
 constexpr uint16_t kAddrReturnDelay = 9;
+// Return Delay Time raw (2µs 単位)。0 だと片線ハーフデュプレクス配線の
+// ターンアラウンドで応答先頭バイトが化け、読取が数十%の率で落ちる (実測)。
+// 動作実績のある旧実装は工場出荷値 250(500µs) のままだった。50µs で妥協
+constexpr uint8_t kReturnDelayRaw = 25;
 constexpr uint16_t kAddrOperatingMode = 11;
 constexpr uint16_t kAddrCurrentLimit = 38;
 constexpr uint16_t kAddrShutdown = 63;
@@ -134,56 +138,98 @@ bool DxlBackend::quarantineActive() const {
 
 // ---------------- 初期化 (§4.1) ----------------
 
-bool DxlBackend::init(cfg::Profile profile) {
-  profile_ = profile;
+namespace {
+// ベンチデバッグ用: ping 失敗時にバス上の応答者を全域探索する
+void scanBusForDebug(DxlWithRxInfo& dxl) {
+  static const uint32_t kBauds[] = {57600, 115200, 1000000, 2000000, 3000000, 4000000};
+  Serial.println("[DXL] bus scan start");
+  for (uint32_t b : kBauds) {
+    dxl.begin(b);
+    for (uint8_t sid = 0; sid <= 5; ++sid) {
+      if (dxl.ping(sid)) {
+        Serial.printf("[DXL] scan: found id=%u baud=%lu model=%d\n", sid,
+                      static_cast<unsigned long>(b), dxl.getModelNumber(sid));
+      }
+    }
+  }
+  Serial.println("[DXL] bus scan done");
+  dxl.begin(cfg::kDxlBaud);  // 設定値へ復帰
+}
+}  // namespace
+
+bool DxlBackend::init() {
   dxl_.begin(cfg::kDxlBaud);
   dxl_.setPortProtocolVersion(cfg::kDxlProtocol);
 
   const uint16_t current_limit_raw =
-      static_cast<uint16_t>(units::currentAToRaw(cfg::currentLimitFor(profile)));
+      static_cast<uint16_t>(units::currentAToRaw(cfg::kCurrentLimitA));
+
+// 各ステップ 3 回リトライ (トルク OFF 中の初期化は再実行安全。実バスは数%の
+// 確率で個々のトランザクションが落ちるため、リトライ無しでは直列 20 ステップ
+// がほぼ確実にどこかで失敗する)。失敗確定時はシリアルへ箇所を出す
+#define DXL_TRY(step, expr)                                    \
+  do {                                                         \
+    bool ok_ = false;                                          \
+    for (int t_ = 0; t_ < 5 && !ok_; ++t_) {                   \
+      ok_ = (expr);                                            \
+      if (!ok_) delay(3);                                      \
+    }                                                          \
+    if (!ok_) {                                                \
+      Serial.printf("[DXL] init fail id=%u: %s\n", id, step);  \
+      return false;                                            \
+    }                                                          \
+  } while (0)
 
   for (uint8_t id : kIds) {
     // ping + Model Number == 1190 検証
-    if (!dxl_.ping(id)) return false;
-    uint8_t mn[2];
-    if (!readRaw(id, kAddrModelNumber, 2, mn)) return false;
-    if (units::le16(mn) != static_cast<int16_t>(cfg::kDxlModelNumber)) return false;
+    if (!dxl_.ping(id)) {
+      scanBusForDebug(dxl_);
+      DXL_TRY("ping", dxl_.ping(id));
+    }
+    {
+      uint8_t mn[2];
+      DXL_TRY("model verify",
+              readRaw(id, kAddrModelNumber, 2, mn) &&
+                  units::le16(mn) == static_cast<int16_t>(cfg::kDxlModelNumber));
+    }
 
     // Torque OFF (EEPROM 書換のため)
-    if (!writeRaw1(id, kAddrTorqueEnable, 0)) return false;
+    DXL_TRY("torque off", writeRaw1(id, kAddrTorqueEnable, 0));
 
     // Operating Mode = 0 (Current Control)
-    if (!writeRaw1(id, kAddrOperatingMode, 0)) return false;
+    DXL_TRY("op mode write", writeRaw1(id, kAddrOperatingMode, 0));
 
     // Current Limit (デフォルト 1750=事実上無制限のため必ず設定)
     {
       const uint8_t d[2] = {static_cast<uint8_t>(current_limit_raw & 0xFF),
                             static_cast<uint8_t>(current_limit_raw >> 8)};
-      if (!verifiedWrite(id, kAddrCurrentLimit, d, 2)) return false;
+      DXL_TRY("current limit write", verifiedWrite(id, kAddrCurrentLimit, d, 2));
     }
 
     // Return Delay Time = 0 / Status Return Level = 2 (配達検証の成立前提)
-    if (!writeRaw1(id, kAddrReturnDelay, 0)) return false;
-    if (!writeRaw1(id, kAddrStatusReturnLevel, 2)) return false;
+    DXL_TRY("return delay write", writeRaw1(id, kAddrReturnDelay, kReturnDelayRaw));
+    DXL_TRY("status level write", writeRaw1(id, kAddrStatusReturnLevel, 2));
 
     // 読み戻し厳密検証 (プロファイル不一致 = FAULT §4.1)
-    if (!verifyByte(id, kAddrOperatingMode, 0)) return false;
-    if (!verifyByte(id, kAddrReturnDelay, 0)) return false;
-    if (!verifyByte(id, kAddrStatusReturnLevel, 2)) return false;
+    DXL_TRY("op mode verify", verifyByte(id, kAddrOperatingMode, 0));
+    DXL_TRY("return delay verify", verifyByte(id, kAddrReturnDelay, kReturnDelayRaw));
+    DXL_TRY("status level verify", verifyByte(id, kAddrStatusReturnLevel, 2));
     {
       uint8_t v[2];
-      if (!readRaw(id, kAddrCurrentLimit, 2, v)) return false;
-      if (units::le16(v) != static_cast<int16_t>(current_limit_raw)) return false;
+      DXL_TRY("current limit verify",
+              readRaw(id, kAddrCurrentLimit, 2, v) &&
+                  units::le16(v) == static_cast<int16_t>(current_limit_raw));
       // PWM Limit(36) は全モード共通の出力上限 → 885(100%) を検証
-      if (!readRaw(id, kAddrPwmLimit, 2, v)) return false;
-      if (units::le16(v) != static_cast<int16_t>(kPwmLimitDefault)) return false;
+      DXL_TRY("pwm limit verify",
+              readRaw(id, kAddrPwmLimit, 2, v) &&
+                  units::le16(v) == static_cast<int16_t>(kPwmLimitDefault));
       // Shutdown(63) は既定値 53 (過熱/過負荷/電圧/ショック保護有効) を要求。
       // 過去に無効化されたまま残っていたら安全既定へ復元して検証する
       uint8_t sd = 0;
-      if (!readRaw(id, kAddrShutdown, 1, &sd)) return false;
+      DXL_TRY("shutdown read", readRaw(id, kAddrShutdown, 1, &sd));
       if (sd != kShutdownDefault) {
-        if (!writeRaw1(id, kAddrShutdown, kShutdownDefault)) return false;
-        if (!verifyByte(id, kAddrShutdown, kShutdownDefault)) return false;
+        DXL_TRY("shutdown write", writeRaw1(id, kAddrShutdown, kShutdownDefault));
+        DXL_TRY("shutdown verify", verifyByte(id, kAddrShutdown, kShutdownDefault));
       }
     }
 
@@ -192,23 +238,24 @@ bool DxlBackend::init(cfg::Profile profile) {
     // した場合は武装(raw=1)のまま残り、以降の初期化トランザクションが 20ms
     // 窓を超えるとトリップするため、非零なら一律 0 (無効) へ落とす
     uint8_t wd = 0;
-    if (!readRaw(id, kAddrBusWatchdog, 1, &wd)) return false;
+    DXL_TRY("watchdog read", readRaw(id, kAddrBusWatchdog, 1, &wd));
     if (wd != 0) {
-      if (!writeRaw1(id, kAddrBusWatchdog, 0)) return false;
+      DXL_TRY("watchdog clear", writeRaw1(id, kAddrBusWatchdog, 0));
     }
 
     // ★Goal Current=0 (モード変更で Current Limit 値へ自動セットされるため必須)
     {
       const uint8_t z[2] = {0, 0};
-      if (!verifiedWrite(id, kAddrGoalCurrent, z, 2)) return false;
+      DXL_TRY("goal zero write", verifiedWrite(id, kAddrGoalCurrent, z, 2));
     }
   }
   // Bus Watchdog 有効化は全サーボの設定完了後にまとめて行う (片側だけ先に
   // 武装すると残りの初期化トランザクションが 20ms 窓を超えた場合に潜在
   // トリップする)。有効化直後から心拍 (零書込) が 5ms 周期で走る前提。
   for (uint8_t id : kIds) {
-    if (!writeRaw1(id, kAddrBusWatchdog, cfg::kBusWatchdogRaw)) return false;
+    DXL_TRY("watchdog arm", writeRaw1(id, kAddrBusWatchdog, cfg::kBusWatchdogRaw));
   }
+#undef DXL_TRY
   // Torque は OFF のまま (Torque ON は enter_balancing() のみ §4.1)
   return true;
 }

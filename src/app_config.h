@@ -16,7 +16,7 @@ constexpr int      kDtFaultConsecutive = 5;
 // ---- ハードウェア (PORT A / DYNAMIXEL) ----
 constexpr uint8_t  kPinRxServo = 33;
 constexpr uint8_t  kPinTxServo = 32;
-constexpr uint32_t kDxlBaud    = 1000000;
+constexpr uint32_t kDxlBaud    = 1000000;  // サーボ EEPROM 設定値と一致必須 (README 手順で 1M 化済み)
 constexpr uint8_t  kDxlIdLeft  = 0;
 constexpr uint8_t  kDxlIdRight = 1;
 constexpr uint16_t kDxlModelNumber = 1190; // XL330-M077
@@ -47,7 +47,8 @@ constexpr int   kImuStaleFaultCycles = 5;     // gyro stale 連続 25ms で FAUL
 // ---- DXL 通信規律 (§4.2) ----
 constexpr uint32_t kDxlIoTimeoutMs        = 2;   // 全トランザクション明示タイムアウト
 constexpr float    kDxlCycleBudgetS       = 0.003f; // 1周期内 DXL 総予算 3ms
-constexpr int      kDxlReadStaleFaultCycles = 4; // 読取失敗 連続 20ms で FAULT
+constexpr int      kDxlReadStaleFaultCycles = 40; // 読取失敗 連続 200ms で FAULT
+// (実バスは読取が単発で落ちる。失敗周期はコースト(§4.2)なので 200ms まで許容)
 constexpr float    kUnverifiedTorqueMaxS  = 0.010f; // 未検証トルク窓 (壁時計)
 constexpr uint8_t  kBusWatchdogRaw        = 1;   // 20ms (raw 1 = 最小)
 constexpr float    kBusWatchdogWindowS    = 0.020f;
@@ -56,8 +57,7 @@ constexpr int      kWatchdogRecoverMaxCount = 3;  // 60s 内 3 回で FAULT
 constexpr float    kWatchdogRecoverWindowS  = 60.0f;
 
 // ---- 電流制限 3 層 + I²t (§2.3) ----
-constexpr float kCurrentLimitNormalA  = 0.900f; // EEPROM Current Limit(38) TUNE
-constexpr float kCurrentLimitBringupA = 0.150f; // ブリングアップ・プロファイル
+constexpr float kCurrentLimitA        = 0.900f; // EEPROM Current Limit(38) TUNE
 constexpr float kCurrentPeakA         = 0.450f; // ソフトピーク TUNE
 constexpr float kCurrentContA         = 0.300f; // ソフト連続 TUNE
 constexpr float kPeakDurationS        = 0.5f;   // I²t: E_max=(Ip²-Ic²)*Tpeak TUNE
@@ -92,14 +92,13 @@ constexpr float kStartWheelMaxRadS   = 1.0f;
 // #ifndef ガード化 (wifi-guard-trace 計画書 §6 T5): trace ビルドのみ
 // platformio.ini から -DBSL_UPRIGHT_HOLD_S=5.0f を注入し、arm_pending
 // ホールド窓を延長する (AP 電源断のビーコン喪失タイムアウト到達をベンチで
-// 決定的に観測するため)。リリース値・型・意味は不変 (未定義時は従来の 1.0f)。
+// 決定的に観測するため)。リリース値・型・意味は不変 (未定義時は 0.5f)。
 #ifndef BSL_UPRIGHT_HOLD_S
-#define BSL_UPRIGHT_HOLD_S 1.0f
+#define BSL_UPRIGHT_HOLD_S 0.5f
 #endif
 constexpr float kUprightHoldS        = BSL_UPRIGHT_HOLD_S;  // 起立/静置検出の保持時間
 constexpr int   kFallEscalationCount = 3;       // 30s 内 3 回で FAULT ラッチ
 constexpr float kFallEscalationWindowS = 30.0f;
-constexpr bool  kAutoArmOnBootDefault  = true;  // コミッショニング後のみ有効 (Q5)
 
 // ---- ヘルス監視閾値 ----
 constexpr float kVoltageMinV   = 3.6f;  // AAA×3 のサグ考慮 TUNE
@@ -111,7 +110,6 @@ constexpr uint32_t kBtnLongPressMs    = 1000; // BtnC STOP/ARM トグル
 
 // ---- NVS レコード (§9.1) ----
 constexpr uint16_t kParamSchemaVersion       = 1;
-constexpr uint16_t kCommissionSchemaVersion  = 1;
 
 // ---- パラメータ許容範囲 [min, max] (§9.1 範囲検証。1つでも外れたら全体破棄) ----
 struct ParamRange { float min; float max; };
@@ -122,12 +120,6 @@ constexpr ParamRange kRangeKv        {0.0f, 1.0f};
 constexpr ParamRange kRangeKvi       {0.0f, 1.0f};
 constexpr ParamRange kRangePitchEq   {-0.35f, 0.35f}; // ±20°
 constexpr ParamRange kRangeThetaRefLimit {0.0f, 0.175f}; // ±10°
-
-// ---- プロファイル (§4.1) ----
-enum class Profile : uint8_t { Bringup = 0, Normal = 1 };
-constexpr float currentLimitFor(Profile p) {
-  return p == Profile::Bringup ? kCurrentLimitBringupA : kCurrentLimitNormalA;
-}
 
 // ---- UDP テレメトリ (Phase1 追加。docs/plans/2026-07-05-udp-telemetry-phase1.md §3.1) ----
 constexpr uint32_t kTelemetryPeriodMs = 50;  // 20 Hz。core1 / priority1 / stack8192

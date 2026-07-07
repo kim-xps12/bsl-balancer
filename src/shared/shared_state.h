@@ -76,8 +76,6 @@ struct Snapshot {
   // 状態
   uint8_t fsm_state = 0;        // core::FsmState
   uint8_t fault_reason = 0;     // core::FaultReason
-  bool commissioned = false;
-  uint8_t profile = 0;          // cfg::Profile
   // 制御量 (SI)
   float theta = 0.0f;           // 0 中心 [rad]
   float theta_rate = 0.0f;      // [rad/s]
@@ -89,6 +87,7 @@ struct Snapshot {
   float i_cmd_right = 0.0f;
   float i_present_left = 0.0f;
   float i_present_right = 0.0f;
+  bool wheel_valid = false;     // DXL 帰還の有効性 (起立検出の必要条件)
   // タイミング
   float dt_last = 0.0f;         // [s]
   float dt_max = 0.0f;
@@ -108,7 +107,7 @@ struct Snapshot {
   uint32_t dt_hist_total[8] = {};  // 周期比 <1.02x,<1.05x,<1.1x,<1.2x,<1.3x,<1.5x,<2.0x,>=2.0x
   uint32_t overrun_total = 0;      // dt > 1.5x 周期の累積総回数
   uint32_t imu_stale_total = 0;    // IMU (gyro) stale 読みの累積総回数
-  // Idle→Balancing 遷移保留 (直立ホールド進行中) 全般。commissioned auto-arm・
+  // Idle→Balancing 遷移保留 (直立ホールド進行中) 全般。自動アーム・
   // BtnC 手動アーム後の Idle の両方で同一機構 (SafetyFsm::armPending() 参照)。
   bool arm_pending = false;
 };
@@ -122,7 +121,7 @@ struct ParamCommand {
   float value;
 };
 
-enum class SaveKind : uint8_t { None = 0, Params, Commission };
+enum class SaveKind : uint8_t { None = 0, Params };
 
 class SharedState {
  public:

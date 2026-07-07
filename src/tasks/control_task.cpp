@@ -39,7 +39,6 @@ struct LoopState {
   core::SafetyFsm fsm;
   PlausibilityMonitor plaus_l, plaus_r;
   core::TuningParams params;
-  cfg::Profile profile = cfg::Profile::Bringup;
 
   int64_t prev_us = 0;
   float dt_max = 0.0f;
@@ -78,9 +77,9 @@ void applyBalanceParams(LoopState& ls) {
   bp.wheel_speed_soft = cfg::kWheelSpeedSoftRadS;
   bp.wheel_speed_hard = cfg::kWheelSpeedHardRadS;
   bp.slew_a_per_s = cfg::kCurrentSlewAPerS;
-  // ソフト上限はプロファイルの EEPROM Current Limit を超えない (超過指令は
+  // ソフト上限は EEPROM Current Limit を超えない (超過指令は
   // XL330 が範囲外エラーを返し verified_write が失敗するため §2.3)
-  const float eeprom_limit = cfg::currentLimitFor(ls.profile);
+  const float eeprom_limit = cfg::kCurrentLimitA;
   bp.i2t.i_peak = std::fmin(cfg::kCurrentPeakA, eeprom_limit);
   bp.i2t.i_cont = std::fmin(cfg::kCurrentContA, bp.i2t.i_peak);
   bp.i2t.peak_duration_s = cfg::kPeakDurationS;
@@ -135,7 +134,6 @@ void controlTaskEntry(void* pvParameters) {
   ControlContext& ctx = *static_cast<ControlContext*>(pvParameters);
   LoopState ls;
   ls.params = ctx.params;
-  ls.profile = ctx.profile;
 
   // 推定器・制御器・FSM の初期化
   core::AttitudeEstimator::Params ep;
@@ -153,8 +151,6 @@ void controlTaskEntry(void* pvParameters) {
   fp.fall_threshold_rad = cfg::kFallThresholdRad;
   fp.fall_escalation_count = cfg::kFallEscalationCount;
   fp.fall_escalation_window_s = cfg::kFallEscalationWindowS;
-  fp.commissioned = ctx.commissioned;
-  fp.auto_arm = cfg::kAutoArmOnBootDefault;
   ls.fsm.setParams(fp);
 
   if (ctx.init_ok) {
@@ -414,8 +410,6 @@ void controlTaskEntry(void* pvParameters) {
     shared::Snapshot sn;
     sn.fsm_state = static_cast<uint8_t>(ls.fsm.state());
     sn.fault_reason = static_cast<uint8_t>(ls.fsm.faultReason());
-    sn.commissioned = ctx.commissioned;
-    sn.profile = static_cast<uint8_t>(ctx.profile);
     sn.theta = theta;
     sn.theta_rate = theta_rate;
     sn.theta_ref = out.theta_ref;
@@ -426,6 +420,7 @@ void controlTaskEntry(void* pvParameters) {
     sn.i_cmd_right = ls.last_cmd_r;
     sn.i_present_left = fb.i_left;
     sn.i_present_right = fb.i_right;
+    sn.wheel_valid = fb.valid;
     sn.dt_last = dt;
     sn.dt_max = ls.dt_max;
     sn.loop_count = ls.loop_count;
