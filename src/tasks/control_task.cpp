@@ -337,20 +337,20 @@ void controlTaskEntry(void* pvParameters) {
         ls.last_cmd_l = cmd_l;
         ls.last_cmd_r = cmd_r;
       } else {
-        // 配達未検証 → 直ちに検証付き零書込 (§4.2)
-        if (!ctx.dxl->writeZeroVerified()) {
-          ctx.dxl->engageQuarantine();
-          raiseFault(ls, ctx, FaultReason::DxlWriteUnverified, now_s);
-        } else {
-          if (!ls.unverified_active) {
-            ls.unverified_active = true;
-            ls.unverified_since_us = now_us;
-          }
-          // 窓超過の FAULT 判定は次周期先頭 (window_exceeded) で行う
-          // 実際に送れたのは零 → スルーレート状態も零へ整合
-          ls.balance.overrideOutput(0.0f, 0.0f);
-          ls.last_cmd_l = ls.last_cmd_r = 0.0f;
+        // 配達未検証 → 直ちに検証付き零書込 (§4.2)。零書込も未検証の場合は
+        // 即ラッチせず未検証窓の継続として扱う (実機バスはバースト的に
+        // >15ms のトランザクション喪失があり、即ラッチだと数秒〜数十秒毎に
+        // FAULT で倒立が止まる実測)。窓超過 (kUnverifiedTorqueMaxS) が唯一の
+        // ラッチ点。バス完全断は XL330 側 Bus Watchdog(20ms) が自律遮断する
+        ctx.dxl->writeZeroVerified();
+        if (!ls.unverified_active) {
+          ls.unverified_active = true;
+          ls.unverified_since_us = now_us;
         }
+        // 窓超過の FAULT 判定は次周期先頭 (window_exceeded) で行う
+        // 実際に送れたのは零 (またはバースト中で未達) → スルーレート状態も零へ整合
+        ls.balance.overrideOutput(0.0f, 0.0f);
+        ls.last_cmd_l = ls.last_cmd_r = 0.0f;
       }
 
       if (out.hard_overspeed) {

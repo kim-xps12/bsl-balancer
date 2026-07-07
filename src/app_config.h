@@ -49,7 +49,9 @@ constexpr uint32_t kDxlIoTimeoutMs        = 2;   // 全トランザクション�
 constexpr float    kDxlCycleBudgetS       = 0.003f; // 1周期内 DXL 総予算 3ms
 constexpr int      kDxlReadStaleFaultCycles = 40; // 読取失敗 連続 200ms で FAULT
 // (実バスは読取が単発で落ちる。失敗周期はコースト(§4.2)なので 200ms まで許容)
-constexpr float    kUnverifiedTorqueMaxS  = 0.010f; // 未検証トルク窓 (壁時計)
+constexpr float    kUnverifiedTorqueMaxS  = 0.050f; // 未検証トルク窓 (壁時計)
+// (実測バーストは>15ms。窓内は毎周期の検証付き零書込で回復を試み続け、
+//  バス完全断は XL330 の Bus Watchdog(20ms) が自律的にトルク遮断する)
 constexpr uint8_t  kBusWatchdogRaw        = 1;   // 20ms (raw 1 = 最小)
 constexpr float    kBusWatchdogWindowS    = 0.020f;
 constexpr float    kQuarantineSilenceS    = 0.040f; // 検疫沈黙窓 (Watchdog窓+余裕)
@@ -82,7 +84,9 @@ constexpr float kVelKv          = 0.10f;   // [rad/(m/s)]
 constexpr float kVelKvi         = 0.05f;   // [rad/m]
 constexpr float kThetaRefLimitRad = 0.0524f; // ±3° クランプ
 constexpr bool  kVelLoopEnabledDefault = true;
-constexpr float kPitchEqDefaultRad = 0.0f; // 平衡点校正値 (0中心 θ の単一変換点でのみ使用)
+constexpr float kPitchEqDefaultRad = 0.0925f; // 平衡点校正値 (0中心 θ の単一変換点でのみ使用)
+// 2026-07-07 実機テレメトリで較正: 直立静止時の生ピッチ実測 +5.3° (30s平均、
+// 完全静止・車輪停止で±5°窓を恒常的に外しアーム不能だった)。UI の Eq[deg] で微調整可
 
 // ---- 状態機械 (§6) ----
 constexpr float kFallThresholdRad    = 0.611f;  // 35°
