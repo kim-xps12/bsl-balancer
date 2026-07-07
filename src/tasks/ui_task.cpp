@@ -4,7 +4,6 @@
 #include <cmath>
 
 #include "../app_config.h"
-#include "../core/param_validation.h"
 #include "../core/safety_fsm.h"
 #include "../core/units.h"
 #include "../hw/param_store.h"
@@ -15,6 +14,16 @@ namespace {
 using core::FsmState;
 
 constexpr float kRadToDeg = 180.0f / units::kPi;
+
+// シリアルデバッグ用フォールト名 (core::FaultReason と同順)
+const char* faultName(uint8_t f) {
+  static const char* kNames[] = {
+      "None", "InitFailed", "ImuStale", "DxlReadStale", "DxlWriteUnverified",
+      "WdTripTorqueOn", "WdRecoverRepeated", "HardOverspeed", "HwErrorStatus",
+      "OverTemp", "UnderVoltage", "LoopOverrun", "CurrentPlausibility",
+      "FallEscalation", "EntryVerifyFailed"};
+  return f < sizeof(kNames) / sizeof(kNames[0]) ? kNames[f] : "?";
+}
 
 const char* stateName(uint8_t s) {
   switch (static_cast<FsmState>(s)) {
@@ -45,10 +54,9 @@ struct PanelState {
 
 void drawPanel(const shared::Snapshot& sn) {
   M5.Display.setCursor(10, 8);
-  M5.Display.printf("%s %s prof:%s dt:%.1fms ",
+  M5.Display.printf("%s %s dt:%.1fms ",
                     stateName(sn.fsm_state),
                     sn.fault_reason ? "FLT" : "   ",
-                    sn.profile == 1 ? "NRM" : "BUP",
                     sn.dt_max * 1000.0f);
   drawRow("Eq[deg]", 30, sn.params.pitch_eq * kRadToDeg, 1);
   drawRow("Kp", 70, sn.params.kp, 2);
@@ -57,11 +65,9 @@ void drawPanel(const shared::Snapshot& sn) {
   M5.Display.setCursor(10, 190);
   M5.Display.printf("th:%+5.1f V:%4.1f Bat:%d%% ", sn.theta * kRadToDeg,
                     sn.voltage, M5.Power.getBatteryLevel());
-  // 保存/コミッショニング (torque OFF 状態でのみ有効 §9.1)
+  // 保存 (torque OFF 状態でのみ有効 §9.1)
   M5.Display.drawRect(20, 210, 110, 28, WHITE);
   M5.Display.drawString("SAVE", 50, 216, 2);
-  M5.Display.drawRect(180, 210, 110, 28, WHITE);
-  M5.Display.drawString("COMISN", 200, 216, 2);
 }
 
 void handleTouch(const shared::Snapshot& sn, shared::SharedState& sh,
@@ -100,10 +106,6 @@ void handleTouch(const shared::Snapshot& sn, shared::SharedState& sh,
     if (x >= 20 && x < 130 && torque_off) {
       ps.pending_save = shared::SaveKind::Params;
       sh.requestSave(shared::SaveKind::Params);
-    } else if (x >= 180 && x < 290 && torque_off) {
-      // 符号試験 (§7) 合格のユーザ明示確認 = コミッショニング (次回起動から有効)
-      ps.pending_save = shared::SaveKind::Commission;
-      sh.requestSave(shared::SaveKind::Commission);
     } else if (!torque_off) {
       M5.Display.setCursor(10, 190);
       M5.Display.print("STOP first (BtnC hold)   ");
@@ -116,14 +118,6 @@ void performSave(const shared::Snapshot& sn, shared::SharedState& sh,
                  PanelState& ps) {
   if (ps.pending_save == shared::SaveKind::Params) {
     hw::ParamStore::saveParams(sn.params);
-  } else if (ps.pending_save == shared::SaveKind::Commission) {
-    core::CommissioningRecord rec;
-    rec.schema_version = cfg::kCommissionSchemaVersion;
-    rec.profile = static_cast<uint8_t>(cfg::Profile::Normal);
-    rec.sign_axis_checksum = core::currentSignAxisChecksum();
-    rec.calib_version = 1;
-    rec.user_confirmed = true;
-    hw::ParamStore::saveCommissioning(rec);
   }
   ps.pending_save = shared::SaveKind::None;
   sh.setSaveDone();
@@ -175,6 +169,24 @@ void uiTaskEntry(void* pvParameters) {
       } else {
         M5.Display.clear();
         ctx.avatar->resume();
+      }
+    }
+
+    // 1Hz シリアル状態出力 (ベンチデバッグ用)
+    {
+      static uint32_t last_dbg_ms = 0;
+      const uint32_t now_ms = millis();
+      if (have_snapshot && now_ms - last_dbg_ms >= 1000) {
+        last_dbg_ms = now_ms;
+        Serial.printf(
+            "[ST] %s flt=%s th=%+6.1f thr=%+6.2f wv=%d wL=%+6.1f wR=%+6.1f "
+            "iL=%+.2f/%+.2f iR=%+.2f/%+.2f V=%.1f T=%.0f dt=%.1f/%.1fms n=%lu\n",
+            stateName(sn.fsm_state), faultName(sn.fault_reason),
+            sn.theta * kRadToDeg, sn.theta_rate, sn.wheel_valid ? 1 : 0,
+            sn.omega_left, sn.omega_right, sn.i_cmd_left, sn.i_present_left,
+            sn.i_cmd_right, sn.i_present_right, sn.voltage, sn.temperature,
+            sn.dt_last * 1000.0f, sn.dt_max * 1000.0f,
+            static_cast<unsigned long>(sn.loop_count));
       }
     }
 

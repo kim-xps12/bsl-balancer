@@ -56,7 +56,7 @@ class DxlBackend {
   explicit DxlBackend(HardwareSerial& serial) : dxl_(serial) {}
 
   // §4.1 初期化シーケンス。失敗時 false (トルク ON しない)。
-  bool init(cfg::Profile profile);
+  bool init();
 
   // ---- 送信ゲート (§4.2 優先順位: 検疫 > save > 心拍 > その他) ----
   void engageQuarantine();               // 検疫開始 (バス全体沈黙)
@@ -101,7 +101,6 @@ class DxlBackend {
   bool watchdogRecoverOne(uint8_t id);
 
   DxlWithRxInfo dxl_;
-  cfg::Profile profile_ = cfg::Profile::Bringup;
   volatile int64_t quarantine_until_us_ = 0;
   bool save_gate_ = false;
   uint8_t health_phase_ = 0;
