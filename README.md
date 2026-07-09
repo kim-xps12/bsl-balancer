@@ -74,7 +74,26 @@ Use your preferred DYNAMIXEL development environment or [m5core2_dynamixel_wizar
 
 ## Usage
 
+**重要（v2ファームウェア）**: 本ファームウェアはXL330を**電流制御モード（Current Control Mode）**・200Hz制御で駆動します。安全設計の詳細は [`docs/plans/2026-07-02-current-mode-freertos-redesign.md`](./docs/plans/2026-07-02-current-mode-freertos-redesign.md) を参照してください。
+
+**IMPORTANT (v2 firmware)**: This firmware drives the XL330 in **Current Control Mode** with a 200 Hz loop. See the design doc above for the safety architecture.
+
+### Initial bring-up (first time only) / 初回ブリングアップ
+
+工場状態（未コミッショニング）では安全のため **PROFILE_BRINGUP（電流上限150mA・自動アームなし）** で起動します。以下の符号試験に合格してから通常運転へ移行してください。
+
+Out of the box the firmware boots in **PROFILE_BRINGUP** (150 mA current limit, no auto-arm). Complete the sign test below before normal operation.
+
+1. 車体を浮かせた状態で電源を入れ、**BtnC（右）長押し1秒**でアーム（DISARMED→IDLE）
+2. BtnB（中央）でパネルを開き、`th`（傾斜角）表示を確認: **前傾で正方向に変化**すること（IMU軸/符号の確認）
+3. 手で立てて倒立開始後、前進時に両輪の正規化速度が正であること（車輪符号の確認）
+4. 問題があれば `src/app_config.h` の `kSignLeft/kSignRight`（車輪）または `imu_backend.cpp` の軸マップを修正
+5. 合格したらパネルの **[COMISN]** をタップ（トルクOFF状態で）→ 次回起動から **PROFILE_NORMAL（900mA・自動アーム有効）**
+
 ### How to stand up
+
+※コミッショニング完了後の手順です（自動アーム有効）。初回は上のブリングアップを先に実施してください。
+(After commissioning, auto-arm is enabled. Run the bring-up above first.)
 
 1. 電池ボックスの電源スイッチをONにします
     
@@ -125,14 +144,23 @@ If you find this difficult, please try the following steps:
 
     Tap the B button (middle) to display the control panel.
 
-1. [+]ボタンまたは[-]ボタンでパラメータ（P, I, D各ゲインと目標角度）を変更できます
+1. [+]/[-]で `Eq`（平衡点トリム, deg）・`Kp`・`Ki`・`Kd` を変更できます（内部はSI単位: A/rad系）
 
-    Use the [+] or [-] buttons to change parameters (P, I, D gains, and target angle).
+    Use [+]/[-] to adjust `Eq` (equilibrium trim, deg), `Kp`, `Ki`, `Kd` (internally SI: A/rad).
 
-**NOTE**
-設定したパラメータは電源の再投入などのリセットで失われます．EEPROMに保存する機能は今後追加される予定です．
+1. **[SAVE]** をタップすると設定をNVSへ保存します（**トルクOFF状態でのみ有効**。倒立中はBtnC長押しで停止してから）
 
-The configured parameters will be lost upon reset, such as when the power is cycled. A feature to save settings to EEPROM will be added in the future.
+    Tap **[SAVE]** to persist settings to NVS (only while torque is OFF — stop with a BtnC long-press first).
+
+### Stop / Safety
+
+- **BtnC（右）長押し1秒 = 停止/アーム トグル**（DISARMED⇄IDLE）。倒立中でも即座にトルクを切ります
+- **確実な停止は電池ボックスの電源スイッチ**です（タッチボタンは利便機能であり安全装置ではありません）
+- 転倒すると自動でトルクOFFになり、立て直して約2秒静止すると再開します（30秒に3回転倒すると安全のためFAULTでラッチ→本体リセットで復帰）
+- FAULT時はavatarが怒り顔になります。復帰は本体リセット。サーボ側Shutdown（過熱等）が原因の場合はサーボ電源の再投入も必要です
+
+- **BtnC (right) long-press = STOP/ARM toggle.** The hard stop is the battery box power switch (touch buttons are convenience, not safety devices).
+- After a fall, torque turns off automatically; stand it still for ~2 s to resume. Three falls within 30 s latch a FAULT (reset to recover; servo-side Shutdown also needs a servo power cycle).
 
 
 
