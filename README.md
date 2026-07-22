@@ -56,6 +56,43 @@ This repository no longer supports Arduino IDE.
 The previous code is saved in `for_arduino_ide`, so it can be used as a example.
 If you are developing with Arduino IDE, you can use this as a base by manually reflecting the contents of the code in PIO code.
 
+### PlatformIO environments
+
+このPlatformIOプロジェクトは，対象HWごとにenvironmentとソースディレクトリを分けています．`board`の設定はビルド・書き込み方法を決めるものであり，接続されたHWに応じてファームウェアを自動選択するものではありません．
+
+| Environment | Target HW | Source |
+| --- | --- | --- |
+| `m5stack-core2` | M5Stack Core2（倒立振子） | `src/balancer/` |
+| `m5stickc-plus` | M5StickC Plus 1.1（ジョイスティックコントローラ） | `src/joystick/` |
+
+VS Codeでは，下部ステータスバーのPlatformIO Environment Switcherで対象environmentを選択してからBuildまたはUploadを実行します．誤選択を避けるには，PlatformIOサイドバーの `PROJECT TASKS` から対象environmentを開き，`General` → `Build` または `Upload` を選択してください．下部バーのUploadボタンは，現在選択中のenvironmentを書き込みます．
+
+CLIでは `-e` で対象environmentを明示します．
+
+```sh
+# 倒立振子をビルド／書き込み
+pio run -e m5stack-core2
+pio run -e m5stack-core2 -t upload
+
+# ジョイスティックコントローラをビルド／書き込み
+pio run -e m5stickc-plus
+pio run -e m5stickc-plus -t upload
+
+# 両方をビルド（書き込みは行わない）
+pio run
+```
+
+複数のM5Stackデバイスを同時にUSB接続する場合，PlatformIOはenvironmentとシリアルポートの対応を自動判別しません．`pio device list` でポートを確認し，書き込み先を明示してください．
+
+```sh
+pio device list
+pio run -e m5stickc-plus -t upload --upload-port /dev/cu.usbserial-XXXXXXXX
+```
+
+### ESP-NOW joystick receiver
+
+`src/balancer/main.cpp`に含まれるESP-NOW受信処理は，ジョイスティック値の受信確認用サンプル実装です．現時点ではM5StickC Plusから受信した`PosX`と`PosY`をシリアルモニタへ表示するだけであり，倒立制御の入力には使用していません．
+
 ## Parts 3D-Print and Assembly
 - please refer **fron** and **back** view.
 - manual: coming soon !
@@ -155,4 +192,3 @@ The configured parameters will be lost upon reset, such as when the power is cyc
 - M5Unified: [https://github.com/m5stack/M5Unified](https://github.com/m5stack/M5Unified)
 
 - TKJElectronics KalmanFilter Library: [https://github.com/TKJElectronics/KalmanFilter](https://github.com/TKJElectronics/KalmanFilter)
-
