@@ -30,6 +30,7 @@ bool espnow_receiver_ready = false;
 bool espnow_receiver_pending = false;
 bool espnow_peer_reset_pending = false;
 bool espnow_send_in_flight = false;
+bool espnow_sender_initialized = false;
 uint8_t espnow_consecutive_send_failures = 0;
 uint16_t espnow_position_sequence = 0;
 
@@ -210,6 +211,58 @@ void sendJoystickPosition(int8_t pos_x, int8_t pos_y) {
 
 }  // namespace
 
+enum class LinkDisplayStatus {
+  Error,
+  Waiting,
+  Connected,
+};
+
+static LinkDisplayStatus getLinkDisplayStatus() {
+  if (!espnow_sender_initialized) {
+    return LinkDisplayStatus::Error;
+  }
+
+  portENTER_CRITICAL(&espnow_link_mux);
+  const bool connected = espnow_receiver_ready;
+  portEXIT_CRITICAL(&espnow_link_mux);
+  return connected ? LinkDisplayStatus::Connected : LinkDisplayStatus::Waiting;
+}
+
+static void drawLinkStatus(bool force = false) {
+  static LinkDisplayStatus previous_status = LinkDisplayStatus::Error;
+  static bool has_previous_status = false;
+  const LinkDisplayStatus status = getLinkDisplayStatus();
+  if (!force && has_previous_status && status == previous_status) {
+    return;
+  }
+
+  uint16_t status_color = RED;
+  const char* status_text = "ERR";
+  switch (status) {
+    case LinkDisplayStatus::Connected:
+      status_color = GREEN;
+      status_text = "OK";
+      break;
+    case LinkDisplayStatus::Waiting:
+      status_color = YELLOW;
+      status_text = "WAIT";
+      break;
+    case LinkDisplayStatus::Error:
+      break;
+  }
+
+  // Clear the full status field so no pixels from a longer previous state
+  // (for example WAIT -> OK) remain visible.
+  M5.Display.fillRect(55, 145, 80, 28, BLACK);
+  M5.Display.drawLine(0, 135, M5.Display.width() - 1, 135, status_color);
+  M5.Display.setTextColor(status_color, BLACK);
+  M5.Display.setCursor(55, 165);
+  M5.Display.printf("%-4s", status_text);
+
+  previous_status = status;
+  has_previous_status = true;
+}
+
 static void waitMiniJoyCReady() {
   while (!joyc.begin(&Wire, MiniJoyC_ADDR, MiniJoyC_SDA, MiniJoyC_SCL,
                      100000UL)) {
@@ -222,24 +275,25 @@ static void drawStaticUi() {
   M5.Display.setTextColor(WHITE, BLACK);
 
   M5.Display.setCursor(0, 20);
-  M5.Display.print("ADC X:");
-  M5.Display.setCursor(0, 50);
-  M5.Display.print("ADC Y:");
-
-  M5.Display.drawLine(0, 80, 135, 80, ORANGE);
-
-  M5.Display.setCursor(0, 100);
   M5.Display.print("POS X:");
-  M5.Display.setCursor(0, 130);
+  M5.Display.setCursor(0, 50);
   M5.Display.print("POS Y:");
 
-  M5.Display.drawLine(0, 160, 135, 160, ORANGE);
-  M5.Display.setCursor(0, 180);
+  M5.Display.drawLine(0, 80, M5.Display.width() - 1, 80, DARKGREY);
+
+  M5.Display.setCursor(0, 110);
   M5.Display.print("BtnVal:");
 
+  M5.Display.setCursor(0, 165);
+  M5.Display.print("LINK:");
+  drawLinkStatus(true);
+
   M5.Display.setTextColor(YELLOW, BLACK);
-  M5.Display.setCursor(0, 220);
-  M5.Display.print("BtnB x2:Cal");
+  M5.Display.setFont(&fonts::Font2);
+  M5.Display.setTextDatum(textdatum_t::middle_center);
+  M5.Display.drawString("Button R x2: Cal", M5.Display.width() / 2, 220);
+  M5.Display.setTextDatum(textdatum_t::top_left);
+  M5.Display.setFont(&fonts::FreeMonoBold9pt7b);
 }
 
 static void drawRangeCalibrationUi() {
@@ -392,7 +446,7 @@ void setup() {
   M5.begin();
   waitMiniJoyCReady();
   joyc.setLEDColor(0x000000);
-  initializeEspNowSender();
+  espnow_sender_initialized = initializeEspNowSender();
 
   M5.Display.setRotation(0);
   M5.Display.setFont(&fonts::FreeMonoBold9pt7b);
@@ -416,10 +470,6 @@ void loop() {
   }
   last_sample_ms = now;
 
-  // Read raw ADC values (0~4095).
-  int16_t adc_x = joyc.getADCValue(ADC_X);
-  int16_t adc_y = joyc.getADCValue(ADC_Y);
-
   // Read normalized position (-128~127).
   int8_t pos_x = joyc.getPOSValue(POS_X, _8bit);
   int8_t pos_y = joyc.getPOSValue(POS_Y, _8bit);
@@ -430,15 +480,12 @@ void loop() {
     // Redraw only fixed-width value fields. The opaque text background erases
     // the previous value without flashing the whole display.
     M5.Display.setCursor(66, 20);
-    M5.Display.printf("%4d", adc_x);
-    M5.Display.setCursor(66, 50);
-    M5.Display.printf("%4d", adc_y);
-    M5.Display.setCursor(66, 100);
     M5.Display.printf("%4d", pos_x);
-    M5.Display.setCursor(66, 130);
+    M5.Display.setCursor(66, 50);
     M5.Display.printf("%4d", pos_y);
-    M5.Display.setCursor(77, 180);
+    M5.Display.setCursor(77, 110);
     M5.Display.printf("%d", joyc.getButtonStatus());
+    drawLinkStatus();
     last_display_ms = now;
   }
 }
