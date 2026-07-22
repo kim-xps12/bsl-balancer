@@ -276,7 +276,7 @@ void setup(){
   const BaseType_t ID_CORE_CTRL_MAIN = 0;
   xTaskCreatePinnedToCore(controlLoopTask, "Control Loop Task", MEMORY_STACK, NULL, PRIORIRY_SPIN_MAIN, NULL, ID_CORE_CTRL_MAIN);
   
-  const UBaseType_t PRIORIRY_SPIN_SUB = 2;
+  const UBaseType_t PRIORIRY_SPIN_SUB = 1;
   const BaseType_t ID_CORE_CTRL_SUB = 1;
   xTaskCreatePinnedToCore(uiLoopTask,      "UI Loop Task",      MEMORY_STACK, NULL, PRIORIRY_SPIN_SUB,  NULL, ID_CORE_CTRL_SUB);
 }
