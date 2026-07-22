@@ -89,6 +89,10 @@ pio device list
 pio run -e m5stickc-plus -t upload --upload-port /dev/cu.usbserial-XXXXXXXX
 ```
 
+### ESP-NOW joystick receiver
+
+`src/balancer/main.cpp`に含まれるESP-NOW受信処理は，ジョイスティック値の受信確認用サンプル実装です．現時点ではM5StickC Plusから受信した`PosX`と`PosY`をシリアルモニタへ表示するだけであり，倒立制御の入力には使用していません．
+
 ## Parts 3D-Print and Assembly
 - please refer **fron** and **back** view.
 - manual: coming soon !

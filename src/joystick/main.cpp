@@ -1,5 +1,10 @@
 #include "M5Unified.h"
 #include "M5HatMiniJoyC.h"
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+
+#include "EspNowProtocol.h"
 
 // Based on the official M5Stack Hat Mini JoyC Arduino tutorial:
 // https://docs.m5stack.com/ja/arduino/projects/hat/hat_mini_joyc
@@ -10,8 +15,200 @@
 
 constexpr size_t CENTER_CAL_SAMPLES = 100;
 constexpr uint16_t MIN_CAL_HALF_RANGE = 500;
+constexpr uint32_t POSITION_SAMPLE_INTERVAL_MS = 20;
+constexpr uint32_t DISPLAY_UPDATE_INTERVAL_MS = 60;
+constexpr uint8_t MAX_CONSECUTIVE_SEND_FAILURES = 10;
 
 M5HatMiniJoyC joyc;
+
+namespace {
+
+portMUX_TYPE espnow_link_mux = portMUX_INITIALIZER_UNLOCKED;
+uint8_t espnow_receiver_mac[ESP_NOW_ETH_ALEN]{};
+uint8_t espnow_pending_receiver_mac[ESP_NOW_ETH_ALEN]{};
+bool espnow_receiver_ready = false;
+bool espnow_receiver_pending = false;
+bool espnow_peer_reset_pending = false;
+bool espnow_send_in_flight = false;
+uint8_t espnow_consecutive_send_failures = 0;
+uint16_t espnow_position_sequence = 0;
+
+void recordEspNowSendFailureLocked() {
+  if (espnow_consecutive_send_failures < UINT8_MAX) {
+    ++espnow_consecutive_send_failures;
+  }
+  if (espnow_consecutive_send_failures >= MAX_CONSECUTIVE_SEND_FAILURES) {
+    espnow_receiver_ready = false;
+    espnow_peer_reset_pending = true;
+  }
+}
+
+void onEspNowDiscoveryReceived(const uint8_t* sender_mac, const uint8_t* data,
+                               int data_length) {
+  if (sender_mac == nullptr || data == nullptr ||
+      data_length != sizeof(espnow_protocol::Packet)) {
+    return;
+  }
+
+  espnow_protocol::Packet packet{};
+  memcpy(&packet, data, sizeof(packet));
+  if (!espnow_protocol::isValidPacket(
+          packet, espnow_protocol::PacketType::Discovery)) {
+    return;
+  }
+
+  portENTER_CRITICAL(&espnow_link_mux);
+  if (!espnow_receiver_ready && !espnow_receiver_pending) {
+    memcpy(espnow_pending_receiver_mac, sender_mac,
+           sizeof(espnow_pending_receiver_mac));
+    espnow_receiver_pending = true;
+  }
+  portEXIT_CRITICAL(&espnow_link_mux);
+}
+
+void onEspNowPositionSent(const uint8_t* receiver_mac,
+                          esp_now_send_status_t status) {
+  (void)receiver_mac;
+  portENTER_CRITICAL(&espnow_link_mux);
+  espnow_send_in_flight = false;
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    espnow_consecutive_send_failures = 0;
+  } else {
+    recordEspNowSendFailureLocked();
+  }
+  portEXIT_CRITICAL(&espnow_link_mux);
+}
+
+bool initializeEspNowSender() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, false);
+  delay(20);
+
+  esp_err_t result = esp_wifi_set_ps(WIFI_PS_NONE);
+  if (result != ESP_OK) {
+    Serial.printf("ESP-NOW: disabling Wi-Fi sleep failed: %d\n", result);
+    return false;
+  }
+
+  result = esp_wifi_set_channel(espnow_protocol::WIFI_CHANNEL,
+                                WIFI_SECOND_CHAN_NONE);
+  if (result != ESP_OK) {
+    Serial.printf("ESP-NOW: setting channel failed: %d\n", result);
+    return false;
+  }
+
+  result = esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_1M_L);
+  if (result != ESP_OK) {
+    Serial.printf("ESP-NOW: setting PHY rate failed: %d\n", result);
+    return false;
+  }
+
+  result = esp_now_init();
+  if (result != ESP_OK) {
+    Serial.printf("ESP-NOW: initialization failed: %d\n", result);
+    return false;
+  }
+
+  result = esp_now_register_recv_cb(onEspNowDiscoveryReceived);
+  if (result != ESP_OK) {
+    Serial.printf("ESP-NOW: receive callback failed: %d\n", result);
+    return false;
+  }
+
+  result = esp_now_register_send_cb(onEspNowPositionSent);
+  if (result != ESP_OK) {
+    Serial.printf("ESP-NOW: send callback failed: %d\n", result);
+    return false;
+  }
+
+  uint8_t local_mac[ESP_NOW_ETH_ALEN];
+  esp_wifi_get_mac(WIFI_IF_STA, local_mac);
+  Serial.printf(
+      "ESP-NOW sender ready: %02X:%02X:%02X:%02X:%02X:%02X, channel %u\n",
+      local_mac[0], local_mac[1], local_mac[2], local_mac[3], local_mac[4],
+      local_mac[5], espnow_protocol::WIFI_CHANNEL);
+  return true;
+}
+
+void serviceEspNowPeer() {
+  bool reset_peer = false;
+  bool add_peer = false;
+  uint8_t old_mac[ESP_NOW_ETH_ALEN]{};
+  uint8_t new_mac[ESP_NOW_ETH_ALEN]{};
+
+  portENTER_CRITICAL(&espnow_link_mux);
+  if (espnow_peer_reset_pending) {
+    memcpy(old_mac, espnow_receiver_mac, sizeof(old_mac));
+    espnow_peer_reset_pending = false;
+    reset_peer = true;
+  }
+  if (espnow_receiver_pending) {
+    memcpy(new_mac, espnow_pending_receiver_mac, sizeof(new_mac));
+    espnow_receiver_pending = false;
+    add_peer = true;
+  }
+  portEXIT_CRITICAL(&espnow_link_mux);
+
+  if (reset_peer && esp_now_is_peer_exist(old_mac)) {
+    esp_now_del_peer(old_mac);
+    Serial.println("ESP-NOW: receiver link lost; waiting for discovery");
+  }
+
+  if (!add_peer) {
+    return;
+  }
+
+  esp_now_peer_info_t peer{};
+  memcpy(peer.peer_addr, new_mac, sizeof(peer.peer_addr));
+  peer.channel = espnow_protocol::WIFI_CHANNEL;
+  peer.ifidx = WIFI_IF_STA;
+  peer.encrypt = false;
+
+  const esp_err_t result = esp_now_add_peer(&peer);
+  if (result != ESP_OK && result != ESP_ERR_ESPNOW_EXIST) {
+    Serial.printf("ESP-NOW: adding receiver failed: %d\n", result);
+    return;
+  }
+
+  portENTER_CRITICAL(&espnow_link_mux);
+  memcpy(espnow_receiver_mac, new_mac, sizeof(espnow_receiver_mac));
+  espnow_receiver_ready = true;
+  espnow_consecutive_send_failures = 0;
+  portEXIT_CRITICAL(&espnow_link_mux);
+
+  Serial.printf("ESP-NOW receiver found: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                new_mac[0], new_mac[1], new_mac[2], new_mac[3], new_mac[4],
+                new_mac[5]);
+}
+
+void sendJoystickPosition(int8_t pos_x, int8_t pos_y) {
+  uint8_t receiver_mac[ESP_NOW_ETH_ALEN];
+
+  portENTER_CRITICAL(&espnow_link_mux);
+  if (!espnow_receiver_ready || espnow_send_in_flight) {
+    portEXIT_CRITICAL(&espnow_link_mux);
+    return;
+  }
+  memcpy(receiver_mac, espnow_receiver_mac, sizeof(receiver_mac));
+  espnow_send_in_flight = true;
+  portEXIT_CRITICAL(&espnow_link_mux);
+
+  const auto packet = espnow_protocol::makePacket(
+      espnow_protocol::PacketType::JoystickPosition,
+      espnow_position_sequence++, millis(), pos_x, pos_y);
+  const esp_err_t result =
+      esp_now_send(receiver_mac, reinterpret_cast<const uint8_t*>(&packet),
+                   sizeof(packet));
+
+  if (result != ESP_OK) {
+    portENTER_CRITICAL(&espnow_link_mux);
+    espnow_send_in_flight = false;
+    recordEspNowSendFailureLocked();
+    portEXIT_CRITICAL(&espnow_link_mux);
+  }
+}
+
+}  // namespace
 
 static void waitMiniJoyCReady() {
   while (!joyc.begin(&Wire, MiniJoyC_ADDR, MiniJoyC_SDA, MiniJoyC_SCL,
@@ -191,9 +388,11 @@ static void calibrateJoystick() {
 }
 
 void setup() {
+  Serial.begin(115200);
   M5.begin();
   waitMiniJoyCReady();
   joyc.setLEDColor(0x000000);
+  initializeEspNowSender();
 
   M5.Display.setRotation(0);
   M5.Display.setFont(&fonts::FreeMonoBold9pt7b);
@@ -202,10 +401,20 @@ void setup() {
 
 void loop() {
   M5.update();
+  serviceEspNowPeer();
 
   if (M5.BtnB.wasDoubleClicked()) {
     calibrateJoystick();
   }
+
+  static uint32_t last_sample_ms = 0;
+  static uint32_t last_display_ms = 0;
+  const uint32_t now = millis();
+  if (now - last_sample_ms < POSITION_SAMPLE_INTERVAL_MS) {
+    delay(1);
+    return;
+  }
+  last_sample_ms = now;
 
   // Read raw ADC values (0~4095).
   int16_t adc_x = joyc.getADCValue(ADC_X);
@@ -215,18 +424,21 @@ void loop() {
   int8_t pos_x = joyc.getPOSValue(POS_X, _8bit);
   int8_t pos_y = joyc.getPOSValue(POS_Y, _8bit);
 
-  // Redraw only the fixed-width value fields. The opaque text background erases
-  // the previous value without flashing the whole display.
-  M5.Display.setCursor(66, 20);
-  M5.Display.printf("%4d", adc_x);
-  M5.Display.setCursor(66, 50);
-  M5.Display.printf("%4d", adc_y);
-  M5.Display.setCursor(66, 100);
-  M5.Display.printf("%4d", pos_x);
-  M5.Display.setCursor(66, 130);
-  M5.Display.printf("%4d", pos_y);
-  M5.Display.setCursor(77, 180);
-  M5.Display.printf("%d", joyc.getButtonStatus());
+  sendJoystickPosition(pos_x, pos_y);
 
-  delay(30);
+  if (now - last_display_ms >= DISPLAY_UPDATE_INTERVAL_MS) {
+    // Redraw only fixed-width value fields. The opaque text background erases
+    // the previous value without flashing the whole display.
+    M5.Display.setCursor(66, 20);
+    M5.Display.printf("%4d", adc_x);
+    M5.Display.setCursor(66, 50);
+    M5.Display.printf("%4d", adc_y);
+    M5.Display.setCursor(66, 100);
+    M5.Display.printf("%4d", pos_x);
+    M5.Display.setCursor(66, 130);
+    M5.Display.printf("%4d", pos_y);
+    M5.Display.setCursor(77, 180);
+    M5.Display.printf("%d", joyc.getButtonStatus());
+    last_display_ms = now;
+  }
 }
